@@ -1,18 +1,16 @@
 import websockets
-#from utils import save_json
-import utils
-#from client import play
+import asyncio
  
-#asyncio.run(play())
-# Respond within 2 seconds per round
-
 from client import play
-#print(dir(client))
+from utils import save_json
+import json
 
 async def main():
-    
-    return
+    raw_json = await play()
+    state = json.loads(raw_json)
+    save_json(state)
+
 
 if __name__ == "__main__":
-    main
+    asyncio.run(main())
     

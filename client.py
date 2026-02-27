@@ -1,18 +1,23 @@
 import asyncio
 import websockets
 import os
+from dotenv import load_dotenv
 
+load_dotenv()
 
 def get_URL() -> str:
-    TOKEN = os.environ["AINM_TOKEN"]
-    return  f"wss://game.ainm.no/ws?token={TOKEN}"
+    # Fetches URL from env
+    return os.environ["AINM_URL"]
+
 
 async def play():
-    URL = get_URL
+    WS_URL  = get_URL()
 
-    async with websockets.connect(URL) as ws:
+    async with websockets.connect(WS_URL) as ws:
         while True:
             state = await ws.recv()
             return state
             # ... decide actions ...
             #await ws.send('{"actions": [...]}')
+#          asyncio.run(play())
+#       Respond within 2 seconds per round

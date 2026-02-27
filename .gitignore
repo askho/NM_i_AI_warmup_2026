@@ -9,6 +9,8 @@ venv/
 # Secrets
 .env
 .env.*
+data.json
+
 
 # Editor/OS junk
 .vscode/
