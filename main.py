@@ -1,6 +1,7 @@
 import websockets
 import asyncio
- 
+from playwright.async_api import async_playwright
+
 from client import play
 from utils import save_json
 import json

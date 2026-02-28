@@ -10,7 +10,15 @@ venv/
 .env
 .env.*
 data.json
+debug_html/
 
+# Login auth
+save_auth.py
+state.json
+
+# Temp Files
+login_cred_tests.py
+debug_backed.py
 
 # Editor/OS junk
 .vscode/
