@@ -184,7 +184,13 @@ async def play(
                         parts.append(f"{bid}@({p[0]},{p[1]})")
                         inv = b.get("inventory", []) or []
                         parts.append(f"{bid}@({p[0]},{p[1]}) I={len(inv)}")
-                logger.info("Bots | round=%s | %s | score=%s", round_no, " ".join(parts), state.get("score"))
+                logger.info(
+                    "Bots | round=%s | %s | score=%s",
+                    round_no,
+                    " ".join(parts),
+                    state.get("score"),
+                    extra={"is_round_summary": True, "round_no": round_no},
+                )
 ### -------------------------------------------------
 
             msg_type = state.get("type")
@@ -216,7 +222,13 @@ async def play(
                     inv_text = f"I={inv_n}"
                 else:
                     inv_text = "I=?"
-                logger.info("Plan | round=%s | %s %s", round_no, tgt_text, inv_text)
+                logger.info(
+                    "Plan | round=%s | %s %s",
+                    round_no,
+                    tgt_text,
+                    inv_text,
+                    extra={"is_round_summary": True, "round_no": round_no},
+                )
 
             await ws.send(json.dumps({"actions": actions_list}))
 
