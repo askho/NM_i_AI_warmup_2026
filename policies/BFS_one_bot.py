@@ -15,6 +15,23 @@ Pos = Tuple[int, int]
 Action = Dict[str, Any]
 
 
+def _to_pos(p: Any) -> Optional[Pos]:
+    if isinstance(p, dict):
+        if "position" in p:
+            return _to_pos(p.get("position"))
+        if "x" in p and "y" in p:
+            try:
+                return int(p.get("x", 0) or 0), int(p.get("y", 0) or 0)
+            except (TypeError, ValueError):
+                return None
+    if isinstance(p, (list, tuple)) and len(p) >= 2:
+        try:
+            return int(p[0]), int(p[1])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def plan_item_run(state, controller, item_types, walls, blocked, bot):
     """
     Single-bot planner (recomputed every round).
@@ -41,9 +58,10 @@ def plan_item_run(state, controller, item_types, walls, blocked, bot):
     """
 
     def as_pos(p):
-        if isinstance(p, tuple):
-            return p
-        return (int(p[0]), int(p[1]))
+        q = _to_pos(p)
+        if q is None:
+            return (0, 0)
+        return q
 
     def bot_pos(b):
         p = b.get("position", b)
@@ -262,7 +280,10 @@ def decide_action_one_bot(
         return (int(p[0]), int(p[1]))
 
     def as_pos(p):
-        return (int(p[0]), int(p[1]))
+        q = _to_pos(p)
+        if q is None:
+            return (0, 0)
+        return q
 
     def move_action(from_pos, to_pos):
         dx = to_pos[0] - from_pos[0]
@@ -315,10 +336,10 @@ def decide_action_one_bot(
             return True  # if no active order found, don't block pickup/drop logic
         return need.get(t, 0) > 0
 
-    # ---- 1) DROP OFF if near dropoff and carrying something the active order needs ----
+    # ---- 1) DROP OFF only when standing on dropoff and carrying needed item(s) ----
     if active_order:
         carries_needed = any(active_needs_type(t) for t in inv_types if t is not None)
-        if carries_needed and manhattan(pos, controller.dropoff) <= 1:
+        if carries_needed and pos == controller.dropoff:
             return {"bot": bot_id, "action": "drop_off"}
 
     # ---- 2) PICK UP if near the target shelf and it is needed (and room) ----
@@ -368,6 +389,10 @@ def policy(state: Dict[str, Any], controller) -> List[Action]:
 
     bot = bots[0]
 
+    # Debug defaults consumed by client logging.
+    controller._debug_last_target = None
+    controller._debug_last_inventory_count = len(bot.get("inventory", []) or [])
+
     # Static helpers from controller
     blocked = controller.blocked_positions(state)
     item_positions_by_type = controller.build_item_positions_by_type(state)
@@ -411,6 +436,30 @@ def policy(state: Dict[str, Any], controller) -> List[Action]:
     # Convert allocated_items to a list of types for the planner
     item_types = [it.get("type") for it in (allocated_items or []) if isinstance(it, dict) and it.get("type")]
 
+    inv_now = bot.get("inventory", []) or []
+    if len(inv_now) >= 3:
+        drop_path = bfs_path(
+            start=_to_pos(bot.get("position")) or (0, 0),
+            goal=controller.dropoff,
+            width=controller.width,
+            height=controller.height,
+            walls=set(getattr(controller, "walls", set())),
+            blocked=set(blocked),
+        )
+        if drop_path:
+            controller._debug_last_target = controller.dropoff
+            return [
+                decide_action_one_bot(
+                    state,
+                    controller,
+                    bot,
+                    blocked=blocked,
+                    walls=walls,
+                    path=drop_path,
+                    target_pos=controller.dropoff,
+                )
+            ]
+
     ordered_shelves, path_to_first = plan_item_run(
         state=state,
         controller=controller,
@@ -420,18 +469,33 @@ def policy(state: Dict[str, Any], controller) -> List[Action]:
         bot=bot,
     )
 
-    # Determine target_item: prefer the first allocated item if any
+    # Determine target_item aligned with the planned first shelf, so pickup can happen.
     target_item = None
-    if allocated_items:
-        # pick the first allocated item that still exists in state
-        first_type = allocated_items[0].get("type")
-        # find a concrete item object of that type (closest match)
+    if ordered_shelves:
+        planned_shelf = _to_pos(ordered_shelves[0])
         for it in items:
             if not isinstance(it, dict):
                 continue
-            if it.get("type") == first_type:
+            ip = _to_pos(it.get("position"))
+            if planned_shelf is not None and ip == planned_shelf:
                 target_item = it
                 break
+
+    # Fallback: if no planned shelf (or item vanished), keep old behavior.
+    if target_item is None and allocated_items:
+        first_type = allocated_items[0].get("type")
+        for it in items:
+            if isinstance(it, dict) and it.get("type") == first_type:
+                target_item = it
+                break
+
+    # Debug fields consumed by client logging.
+    try:
+        inv = bot.get("inventory", []) or []
+        controller._debug_last_target = _to_pos(target_item.get("position")) if isinstance(target_item, dict) else None
+        controller._debug_last_inventory_count = len(inv)
+    except Exception:
+        pass
 
     action = decide_action_one_bot(
         state,
