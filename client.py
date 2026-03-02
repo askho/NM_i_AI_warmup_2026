@@ -140,8 +140,9 @@ def get_ws_url(difficulty: str, headless: bool = True) -> str:
 
 from typing import Any, Dict, Optional
 
-from policy_selector import PolicySelector, ConstantPolicySelector
+from policy_selector import BotCountPolicySelector, PolicySelector
 from policies.BFS_one_bot import policy as BFSOneBotPolicy
+from policies.multi_bot_optimizer import policy as MultiBotOptimizerPolicy
 
 async def play(
     difficulty: str,
@@ -191,7 +192,7 @@ def start_game(
     if controller is None:
         controller = BotController(policy=BFSOneBotPolicy)
     if selector is None:
-        selector = ConstantPolicySelector(BFSOneBotPolicy)
+        selector = BotCountPolicySelector(BFSOneBotPolicy, MultiBotOptimizerPolicy)
 
     logger.info(f"Starting game | difficulty={difficulty}")
     asyncio.run(play(difficulty, WS_URL, controller, selector))
