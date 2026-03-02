@@ -141,6 +141,7 @@ def get_ws_url(difficulty: str, headless: bool = True) -> str:
 import json
 import websockets
 from typing import Any, Dict, Optional
+from pathlib import Path
 
 
 async def play(
@@ -153,6 +154,17 @@ async def play(
     #raise SystemExit(0) # temp while testing main.py without running the game loop
 
     async with websockets.connect(WS_URL) as ws:
+        run_log_lines: list[str] = []
+        log_path = Path("log.txt")
+        last_round_seen: Optional[int] = None
+
+        def _record(line: str) -> None:
+            run_log_lines.append(line)
+
+        def _should_print_console(round_value: int) -> bool:
+            # Keep console output lightweight: every 5th round only.
+            return round_value >= 0 and round_value % 5 == 0
+
         while True:
             state: Dict[str, Any] = json.loads(await ws.recv())
 ### testing/debugging: log bot positions each round
@@ -166,24 +178,36 @@ async def play(
 
 
             round_no = int(state.get("round", -1) or -1)
+            if round_no >= 0:
+                last_round_seen = round_no
 
-            if 0 <= round_no < 50:
-                bots = state.get("bots", [])
-                parts = []
-                if isinstance(bots, list):
-                    for b in bots:
-                        if not isinstance(b, dict):
-                            continue
-                        bid = b.get("id")
-                        p = _pos_xy(b.get("position"))
-                        if p is None:
-                            continue
-                        parts.append(f"{bid}@({p[0]},{p[1]})")
-                logger.info("Bots | round=%s | %s | score=%s", round_no, " ".join(parts), state.get("score"))
+            bots = state.get("bots", [])
+            parts = []
+            if isinstance(bots, list):
+                for b in bots:
+                    if not isinstance(b, dict):
+                        continue
+                    bid = b.get("id")
+                    p = _pos_xy(b.get("position"))
+                    if p is None:
+                        continue
+                    inv = b.get("inventory", []) or []
+                    parts.append(f"{bid}@({p[0]},{p[1]}) I={len(inv)}")
+            bots_line = f"Bots | round={round_no} | {' '.join(parts)} | score={state.get('score')}"
+            _record(bots_line)
+            if _should_print_console(round_no):
+                logger.info(bots_line)
 ### -------------------------------------------------
 
             msg_type = state.get("type")
             if msg_type == "game_over":
+                final_round = state.get("round")
+                if final_round is None:
+                    final_round = last_round_seen
+                game_over_line = f"game_over | score={state.get('score')} | rounds={final_round}"
+                logger.info(game_over_line)
+                _record(game_over_line)
+                log_path.write_text("\n".join(run_log_lines) + "\n", encoding="utf-8")
                 break
 
             if msg_type != "game_state":
@@ -199,6 +223,21 @@ async def play(
             
             controller.set_policy(selector.select(difficulty=difficulty, state=state))
             actions_list = controller.act(state)
+
+            tgt = getattr(controller, "_debug_last_target", None)
+            inv_n = getattr(controller, "_debug_last_inventory_count", None)
+            if isinstance(tgt, tuple) and len(tgt) == 2:
+                tgt_text = f"T@({tgt[0]},{tgt[1]})"
+            else:
+                tgt_text = "T@(-,-)"
+            if isinstance(inv_n, int):
+                inv_text = f"I={inv_n}"
+            else:
+                inv_text = "I=?"
+            plan_line = f"Plan | round={round_no} | {tgt_text} {inv_text}"
+            _record(plan_line)
+            if _should_print_console(round_no):
+                logger.info(plan_line)
 
             await ws.send(json.dumps({"actions": actions_list}))
 

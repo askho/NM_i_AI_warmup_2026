@@ -302,8 +302,9 @@ class BotController:
         # items
         for item in state.get("items", []):
             pos = item.get("position")
-            if isinstance(pos, (list, tuple)) and len(pos) >= 2:
-                blocked.add((int(pos[0]), int(pos[1])))
+            p = self._coerce_pos(pos)
+            if p is not None:
+                blocked.add(p)
 
         # bots (prefer controller-synced bots if available)
         bots = self.bots if self.bots else state.get("bots", [])
@@ -339,7 +340,10 @@ class BotController:
             return [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
 
         def as_pos(p):
-            return (int(p[0]), int(p[1]))
+            q = self._coerce_pos(p)
+            if q is None:
+                return (0, 0)
+            return q
 
         def shelf_pos(item):
             return as_pos(item.get("position", (0, 0)))
