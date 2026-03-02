@@ -32,6 +32,48 @@ def _to_pos(p: Any) -> Optional[Pos]:
     return None
 
 
+def _order_sequence(order: Dict[str, Any], fallback_index: int = -1) -> int:
+    """Extract numeric order sequence from ids like 'order_12'."""
+    raw_id = str(order.get("id", ""))
+    suffix = raw_id.rsplit("_", 1)[-1]
+    try:
+        return int(suffix)
+    except (TypeError, ValueError):
+        return fallback_index
+
+
+def _select_active_order(orders: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Pick the current active order robustly as order ids increase.
+
+    Prefers the highest-sequence ACTIVE and not-complete order.
+    Falls back to highest-sequence ACTIVE order if `complete` flags are inconsistent.
+    """
+    indexed = [
+        (i, o)
+        for i, o in enumerate(orders or [])
+        if isinstance(o, dict) and o.get("status") == "active"
+    ]
+    if not indexed:
+        return None
+
+    non_complete = [(i, o) for i, o in indexed if not bool(o.get("complete", False))]
+    candidates = non_complete or indexed
+    _, best = max(candidates, key=lambda io: _order_sequence(io[1], io[0]))
+    return best
+
+
+def _remaining_need_counts(order: Optional[Dict[str, Any]]) -> Counter:
+    need = Counter()
+    if not order:
+        return need
+    req = order.get("items_required", []) or order.get("items", []) or []
+    delivered = order.get("items_delivered", []) or []
+    need.update(str(t) for t in req)
+    need.subtract(str(t) for t in delivered)
+    return Counter({k: v for k, v in need.items() if v > 0})
+
+
 def plan_item_run(state, controller, item_types, walls, blocked, bot):
     """
     Single-bot planner (recomputed every round).
@@ -315,26 +357,13 @@ def decide_action_one_bot(
             inv_types.append(it)  # sometimes stored as type string
 
     # ---- find ACTIVE order + what it still needs ----
-    active_order = None
-    for o in state.get("orders", []):
-        if isinstance(o, dict) and o.get("status") == "active" and not o.get("complete", False):
-            active_order = o
-            break
-
-    need = {}
-    if active_order:
-        req = active_order.get("items_required", []) or []
-        delivered = active_order.get("items_delivered", []) or []
-        for t in req:
-            need[t] = need.get(t, 0) + 1
-        for t in delivered:
-            if t in need:
-                need[t] -= 1
+    active_order = _select_active_order(state.get("orders", []) or [])
+    need = _remaining_need_counts(active_order)
 
     def active_needs_type(t):
         if not active_order:
             return True  # if no active order found, don't block pickup/drop logic
-        return need.get(t, 0) > 0
+        return need.get(str(t), 0) > 0
 
     # ---- 1) DROP OFF only when standing on dropoff and carrying needed item(s) ----
     if active_order:
@@ -399,11 +428,8 @@ def policy(state: Dict[str, Any], controller) -> List[Action]:
     walls = getattr(controller, "walls", set())
 
     # Determine ACTIVE order and split items into active vs preview
-    active_order = None
-    for o in state.get("orders", []) or []:
-        if isinstance(o, dict) and o.get("status") == "active":
-            active_order = o
-            break
+    active_order = _select_active_order(state.get("orders", []) or [])
+    need_counts = _remaining_need_counts(active_order)
 
     def _as_list(x):
         return list(x or [])
@@ -413,14 +439,22 @@ def policy(state: Dict[str, Any], controller) -> List[Action]:
     items = state.get("items", []) or []
 
     if active_order is not None:
-        # Items whose type is requested by the active order are "active"
-        req = _as_list(active_order.get("items_required") or active_order.get("items") or [])
-        req_set = set(str(t) for t in req)
+        # Items required by the active order (and still missing) are "active".
+        inv_counter = Counter(
+            str(it.get("type")) for it in (bot.get("inventory", []) or []) if isinstance(it, dict) and it.get("type")
+        )
+        remaining_after_inv = Counter({
+            t: max(0, count - inv_counter.get(t, 0))
+            for t, count in need_counts.items()
+        })
+        active_quota = remaining_after_inv.copy()
         for it in items:
             if not isinstance(it, dict):
                 continue
-            if str(it.get("type")) in req_set:
+            item_type = str(it.get("type"))
+            if active_quota.get(item_type, 0) > 0:
                 active_items.append(it)
+                active_quota[item_type] -= 1
             else:
                 preview_items.append(it)
     else:

@@ -123,3 +123,66 @@ def test_full_inventory_moves_toward_dropoff_instead_of_waiting():
     actions = controller.act(state)
     assert actions[0]["action"] in {"move_right", "move_down"}
 
+
+def test_policy_uses_latest_active_order_by_increasing_order_id():
+    controller = BotController(policy)
+    state = {
+        "type": "game_state",
+        "round": 22,
+        "board": {"width": 6, "height": 4, "walls": []},
+        "drop_off": [5, 3],
+        "bots": [{"id": 0, "position": {"x": 0, "y": 0}, "inventory": []}],
+        "items": [
+            {"id": "milk_1", "type": "milk", "position": [1, 0]},
+            {"id": "butter_1", "type": "butter", "position": [0, 1]},
+        ],
+        "orders": [
+            {
+                "id": "order_0",
+                "status": "active",
+                "items_required": ["milk"],
+                "items_delivered": ["milk"],
+                "complete": True,
+            },
+            {
+                "id": "order_8",
+                "status": "active",
+                "items_required": ["butter"],
+                "items_delivered": [],
+                "complete": False,
+            },
+        ],
+    }
+
+    actions = controller.act(state)
+    assert actions[0]["action"] == "pick_up"
+    assert actions[0]["item_id"] == "butter_1"
+
+
+def test_policy_does_not_pick_extra_item_type_already_fully_delivered():
+    controller = BotController(policy)
+    state = {
+        "type": "game_state",
+        "round": 24,
+        "board": {"width": 6, "height": 4, "walls": []},
+        "drop_off": [5, 3],
+        "bots": [{"id": 0, "position": {"x": 0, "y": 0}, "inventory": []}],
+        "items": [
+            {"id": "milk_1", "type": "milk", "position": [1, 0]},
+            {"id": "milk_2", "type": "milk", "position": [2, 0]},
+            {"id": "bread_1", "type": "bread", "position": [0, 1]},
+        ],
+        "orders": [
+            {
+                "id": "order_10",
+                "status": "active",
+                "items_required": ["milk", "bread"],
+                "items_delivered": ["milk"],
+                "complete": False,
+            }
+        ],
+    }
+
+    actions = controller.act(state)
+    assert actions[0]["action"] == "pick_up"
+    assert actions[0]["item_id"] == "bread_1"
