@@ -1,0 +1,547 @@
+diff --git a/main.py b/main.py
+index 97f0a489ff45602042037ace0c954761977d774f..305e7f5a2fc2e056467cbbc677522edf5707ee33 100644
+--- a/main.py
++++ b/main.py
+@@ -1,31 +1,31 @@
+ import asyncio
+ import logging
+ 
+ from bot_controller import BotController
+ from client import get_ws_url, play
+ from logging_utils import configure_logging
+-from policies.BFS_one_bot import policy as BFSOneBotPolicy
++from policies.optimal_one_bot import policy as NewOptimalPolicy
+ from policy_selector import ConstantPolicySelector
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def main() -> None:
+     configure_logging()
+ 
+     difficulty = "easy"
+     if difficulty != "easy":
+         logger.error("No policy defined for difficulty '%s'", difficulty)
+         raise SystemExit(1)
+ 
+-    policy_instance = BFSOneBotPolicy
++    policy_instance = NewOptimalPolicy
+     selector = ConstantPolicySelector(policy_instance)
+     controller = BotController(policy=policy_instance)
+ 
+     logger.info("Starting game | difficulty=%s", difficulty)
+     ws_url = get_ws_url(difficulty)
+     asyncio.run(play(difficulty, ws_url, controller, selector))
+ 
+ 
+ if __name__ == "__main__":
+     main()
+diff --git a/planning/distances.py b/planning/distances.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..86b92721e7af6051040498ee9a7bedef737cb1f8
+--- /dev/null
++++ b/planning/distances.py
+@@ -0,0 +1,75 @@
++from __future__ import annotations
++
++from collections import deque
++from typing import Dict, Iterable, Optional, Tuple
++
++from planning.pathfinding import neighbors4
++
++Pos = Tuple[int, int]
++
++
++class DistCache:
++    """On-demand BFS distance/path cache for a static grid."""
++
++    def __init__(self, *, width: int, height: int, walls: set[Pos]) -> None:
++        self.width = width
++        self.height = height
++        self.walls = set(walls)
++        self._dist: Dict[Pos, Dict[Pos, int]] = {}
++        self._parent: Dict[Pos, Dict[Pos, Pos]] = {}
++
++    def _is_free(self, p: Pos) -> bool:
++        x, y = p
++        return 0 <= x < self.width and 0 <= y < self.height and p not in self.walls
++
++    def ensure_from(self, start: Pos, blocked: Optional[set[Pos]] = None) -> None:
++        blocked_cells = set(blocked or set()) - {start}
++        key = start
++        if not blocked_cells and key in self._dist:
++            return
++
++        q = deque([start])
++        dist: Dict[Pos, int] = {start: 0}
++        parent: Dict[Pos, Pos] = {}
++
++        while q:
++            cur = q.popleft()
++            for nxt in neighbors4(cur):
++                if nxt in dist:
++                    continue
++                if nxt in blocked_cells:
++                    continue
++                if not self._is_free(nxt):
++                    continue
++                dist[nxt] = dist[cur] + 1
++                parent[nxt] = cur
++                q.append(nxt)
++
++        if not blocked_cells:
++            self._dist[key] = dist
++            self._parent[key] = parent
++        else:
++            self._dist[(start, tuple(sorted(blocked_cells)))] = dist
++            self._parent[(start, tuple(sorted(blocked_cells)))] = parent
++
++    def dist(self, a: Pos, b: Pos, blocked: Optional[set[Pos]] = None) -> int:
++        blocked_cells = set(blocked or set()) - {a}
++        key = a if not blocked_cells else (a, tuple(sorted(blocked_cells)))
++        if key not in self._dist:
++            self.ensure_from(a, blocked)
++        return self._dist[key].get(b, 10**9)
++
++    def path(self, a: Pos, b: Pos, blocked: Optional[set[Pos]] = None) -> list[Pos]:
++        blocked_cells = set(blocked or set()) - {a}
++        key = a if not blocked_cells else (a, tuple(sorted(blocked_cells)))
++        if key not in self._dist:
++            self.ensure_from(a, blocked)
++        dist = self._dist[key]
++        parent = self._parent[key]
++        if b not in dist:
++            return []
++        out = [b]
++        while out[-1] != a:
++            out.append(parent[out[-1]])
++        out.reverse()
++        return out
+diff --git a/planning/onebot_opt.py b/planning/onebot_opt.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac0f533fa630127f54bce5872d0070bdf14bd476
+--- /dev/null
++++ b/planning/onebot_opt.py
+@@ -0,0 +1,181 @@
++from __future__ import annotations
++
++import itertools
++from collections import Counter
++from dataclasses import dataclass
++from typing import Any, Dict, List, Optional, Sequence, Tuple
++
++from planning.distances import DistCache
++from planning.pathfinding import neighbors4
++
++Pos = Tuple[int, int]
++INF = 10**9
++
++
++@dataclass(frozen=True)
++class ItemCand:
++    item_id: str
++    item_type: str
++    shelf_pos: Pos
++    stands: Tuple[Pos, ...]
++
++
++@dataclass
++class TripPlan:
++    item_indices: Tuple[int, ...]
++    stands: Tuple[Pos, ...]
++
++
++class OneBotPlanner:
++    def __init__(self, controller, *, k_per_type: int = 5, max_candidates: int = 18) -> None:
++        self.controller = controller
++        self.k_per_type = k_per_type
++        self.max_candidates = max_candidates
++        self.dist = DistCache(width=controller.width, height=controller.height, walls=set(getattr(controller, "walls", set())))
++
++    @staticmethod
++    def _to_pos(p: Any) -> Optional[Pos]:
++        if isinstance(p, dict):
++            if "position" in p:
++                return OneBotPlanner._to_pos(p.get("position"))
++            if "x" in p and "y" in p:
++                return int(p.get("x", 0) or 0), int(p.get("y", 0) or 0)
++        if isinstance(p, (list, tuple)) and len(p) >= 2:
++            return int(p[0]), int(p[1])
++        return None
++
++    def select_candidates(self, state: Dict[str, Any], need: Counter, bot_pos: Pos, blocked: set[Pos]) -> List[ItemCand]:
++        per_type: Dict[str, List[Tuple[int, ItemCand]]] = {}
++        for item in state.get("items", []):
++            if not isinstance(item, dict):
++                continue
++            t = str(item.get("type"))
++            if need.get(t, 0) <= 0:
++                continue
++            item_id = str(item.get("id", ""))
++            shelf = self._to_pos(item.get("position"))
++            if not item_id or shelf is None:
++                continue
++
++            stands = [p for p in neighbors4(shelf) if self.controller.is_free_static(p) and p not in blocked]
++            if not stands:
++                continue
++
++            d = min(self.dist.dist(bot_pos, s, blocked=blocked) for s in stands)
++            cand = ItemCand(item_id=item_id, item_type=t, shelf_pos=shelf, stands=tuple(stands))
++            per_type.setdefault(t, []).append((d, cand))
++
++        cands: List[ItemCand] = []
++        for entries in per_type.values():
++            entries.sort(key=lambda x: x[0])
++            cands.extend(c for _, c in entries[: self.k_per_type])
++
++        cands.sort(key=lambda c: min(self.dist.dist(bot_pos, s, blocked=blocked) for s in c.stands))
++        return cands[: self.max_candidates]
++
++    def _trip_from_subset(self, *, start: Pos, subset: Sequence[int], cands: Sequence[ItemCand], dropoff: Pos, blocked: set[Pos]) -> Tuple[int, Optional[TripPlan]]:
++        best_cost = INF
++        best_plan: Optional[TripPlan] = None
++        items = [cands[i] for i in subset]
++        for perm_positions in itertools.permutations(range(len(items))):
++            perm_indices = tuple(subset[i] for i in perm_positions)
++            perm_items = [items[i] for i in perm_positions]
++            for stand_choices in itertools.product(*[it.stands for it in perm_items]):
++                cur = start
++                move_cost = 0
++                feasible = True
++                for stand in stand_choices:
++                    d = self.dist.dist(cur, stand, blocked=blocked)
++                    if d >= INF:
++                        feasible = False
++                        break
++                    move_cost += d
++                    cur = stand
++                if not feasible:
++                    continue
++                d_end = self.dist.dist(cur, dropoff, blocked=blocked)
++                if d_end >= INF:
++                    continue
++                total = move_cost + d_end + len(perm_indices) + 1
++                if total < best_cost:
++                    best_cost = total
++                    best_plan = TripPlan(item_indices=perm_indices, stands=tuple(stand_choices))
++        return best_cost, best_plan
++
++    @staticmethod
++    def _meets_need(mask: int, cands: Sequence[ItemCand], need: Counter) -> bool:
++        got = Counter()
++        for i, cand in enumerate(cands):
++            if mask & (1 << i):
++                got[cand.item_type] += 1
++        return all(got[t] >= need[t] for t in need)
++
++    @staticmethod
++    def _subsets_upto3(n: int) -> List[int]:
++        out = []
++        indices = range(n)
++        for r in (1, 2, 3):
++            for comb in itertools.combinations(indices, r):
++                m = 0
++                for i in comb:
++                    m |= 1 << i
++                out.append(m)
++        return out
++
++    def build_plan(self, *, state: Dict[str, Any], bot_pos: Pos, need: Counter, blocked: set[Pos], dropoff: Pos) -> List[Dict[str, Any]]:
++        if not need:
++            return []
++        cands = self.select_candidates(state, need, bot_pos, blocked)
++        if not cands:
++            return []
++
++        n = len(cands)
++        subsets = self._subsets_upto3(n)
++        trip_start: Dict[int, Tuple[int, Optional[TripPlan]]] = {}
++        trip_drop: Dict[int, Tuple[int, Optional[TripPlan]]] = {}
++        for subset_mask in subsets:
++            subset = [i for i in range(n) if subset_mask & (1 << i)]
++            trip_start[subset_mask] = self._trip_from_subset(start=bot_pos, subset=subset, cands=cands, dropoff=dropoff, blocked=blocked)
++            trip_drop[subset_mask] = self._trip_from_subset(start=dropoff, subset=subset, cands=cands, dropoff=dropoff, blocked=blocked)
++
++        dp: Dict[int, int] = {0: 0}
++        prev: Dict[int, Tuple[int, int]] = {}
++        for mask in range(1 << n):
++            if mask not in dp:
++                continue
++            for subset in subsets:
++                if mask & subset:
++                    continue
++                trip_cost, _ = trip_start[subset] if mask == 0 else trip_drop[subset]
++                if trip_cost >= INF:
++                    continue
++                new_mask = mask | subset
++                cand_cost = dp[mask] + trip_cost
++                if new_mask not in dp or cand_cost < dp[new_mask]:
++                    dp[new_mask] = cand_cost
++                    prev[new_mask] = (mask, subset)
++
++        feasible_masks = [m for m in dp if self._meets_need(m, cands, need)]
++        if not feasible_masks:
++            return []
++        best_mask = min(feasible_masks, key=lambda m: dp[m])
++
++        batches: List[int] = []
++        cur = best_mask
++        while cur:
++            pm, sub = prev[cur]
++            batches.append(sub)
++            cur = pm
++        batches.reverse()
++
++        steps: List[Dict[str, Any]] = []
++        for batch in batches:
++            _, trip = trip_start[batch] if not steps else trip_drop[batch]
++            if trip is None:
++                return []
++            for idx, stand in zip(trip.item_indices, trip.stands):
++                steps.append({"kind": "MOVE_TO", "target": stand})
++                steps.append({"kind": "PICK", "item_id": cands[idx].item_id, "shelf": cands[idx].shelf_pos})
++            steps.append({"kind": "MOVE_TO", "target": dropoff})
++            steps.append({"kind": "DROPOFF"})
++        return steps
+diff --git a/policies/optimal_one_bot.py b/policies/optimal_one_bot.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b76ec6bcc88d485db8926d6965adeb0f2c47a3e1
+--- /dev/null
++++ b/policies/optimal_one_bot.py
+@@ -0,0 +1,166 @@
++from __future__ import annotations
++
++from collections import Counter
++from typing import Any, Dict, List, Optional, Tuple
++
++from planning.onebot_opt import OneBotPlanner
++
++Pos = Tuple[int, int]
++Action = Dict[str, Any]
++
++
++def _to_pos(p: Any) -> Optional[Pos]:
++    if isinstance(p, dict):
++        if "position" in p:
++            return _to_pos(p.get("position"))
++        if "x" in p and "y" in p:
++            return int(p.get("x", 0) or 0), int(p.get("y", 0) or 0)
++    if isinstance(p, (list, tuple)) and len(p) >= 2:
++        return int(p[0]), int(p[1])
++    return None
++
++
++def _order_sequence(order: Dict[str, Any], fallback_index: int = -1) -> int:
++    raw_id = str(order.get("id", ""))
++    suffix = raw_id.rsplit("_", 1)[-1]
++    try:
++        return int(suffix)
++    except (TypeError, ValueError):
++        return fallback_index
++
++
++def _active_order(orders: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
++    indexed = [(i, o) for i, o in enumerate(orders or []) if isinstance(o, dict) and o.get("status") == "active"]
++    if not indexed:
++        return None
++    non_complete = [(i, o) for i, o in indexed if not bool(o.get("complete", False))]
++    _, best = max(non_complete or indexed, key=lambda io: _order_sequence(io[1], io[0]))
++    return best
++
++
++def _remaining_need(order: Optional[Dict[str, Any]]) -> Counter:
++    if not order:
++        return Counter()
++    req = order.get("items_required", []) or order.get("items", []) or []
++    delivered = order.get("items_delivered", []) or []
++    need = Counter(str(t) for t in req)
++    need.subtract(str(t) for t in delivered)
++    return Counter({k: v for k, v in need.items() if v > 0})
++
++
++def _inventory_types(inv: List[Any]) -> List[str]:
++    out: List[str] = []
++    for item in inv or []:
++        if isinstance(item, str):
++            out.append(item)
++        elif isinstance(item, dict) and item.get("type"):
++            out.append(str(item.get("type")))
++    return out
++
++
++def _move_action(a: Pos, b: Pos) -> str:
++    dx, dy = b[0] - a[0], b[1] - a[1]
++    if dx == 1 and dy == 0:
++        return "move_right"
++    if dx == -1 and dy == 0:
++        return "move_left"
++    if dx == 0 and dy == 1:
++        return "move_down"
++    if dx == 0 and dy == -1:
++        return "move_up"
++    return "wait"
++
++
++class NewOptimalPolicy:
++    def __init__(self) -> None:
++        self._planner: Optional[OneBotPlanner] = None
++        self._queue: List[Dict[str, Any]] = []
++        self._last_order_id: Optional[str] = None
++
++    def _ensure_planner(self, controller) -> None:
++        if self._planner is None:
++            self._planner = OneBotPlanner(controller)
++
++    def _should_replan(self, state: Dict[str, Any], active_order_id: Optional[str]) -> bool:
++        if active_order_id != self._last_order_id:
++            return True
++        if not self._queue:
++            return True
++        planned_ids = [s.get("item_id") for s in self._queue if s.get("kind") == "PICK"]
++        current_item_ids = {str(it.get("id")) for it in state.get("items", []) if isinstance(it, dict)}
++        return any(pid not in current_item_ids for pid in planned_ids if pid)
++
++    def _build_queue(self, state: Dict[str, Any], controller, bot_pos: Pos, need: Counter) -> None:
++        self._ensure_planner(controller)
++        blocked = controller.blocked_positions(state)
++        blocked.discard(bot_pos)
++        self._queue = self._planner.build_plan(
++            state=state,
++            bot_pos=bot_pos,
++            need=need,
++            blocked=blocked,
++            dropoff=controller.dropoff,
++        )
++
++    def __call__(self, state: Dict[str, Any], controller) -> List[Action]:
++        if state.get("type") != "game_state":
++            return []
++        bots = state.get("bots", [])
++        if not isinstance(bots, list) or not bots:
++            return []
++        bot = bots[0]
++        bot_id = bot.get("id")
++        bot_pos = _to_pos(bot.get("position")) or (0, 0)
++        inv = bot.get("inventory", []) or []
++
++        order = _active_order(state.get("orders", []) or [])
++        order_id = str(order.get("id")) if isinstance(order, dict) else None
++        need = _remaining_need(order)
++        inv_types = _inventory_types(inv)
++
++        if bot_pos == controller.dropoff and any(need.get(t, 0) > 0 for t in inv_types):
++            return [{"bot": bot_id, "action": "drop_off"}]
++
++        if self._should_replan(state, order_id):
++            self._build_queue(state, controller, bot_pos, need)
++            self._last_order_id = order_id
++
++        if not self._queue:
++            return [{"bot": bot_id, "action": "wait"}]
++
++        for _ in range(4):
++            if not self._queue:
++                break
++            step = self._queue[0]
++            if step["kind"] == "MOVE_TO":
++                target = step["target"]
++                blocked = controller.blocked_positions(state)
++                blocked.discard(bot_pos)
++                self._ensure_planner(controller)
++                path = self._planner.dist.path(bot_pos, target, blocked=blocked)
++                if len(path) >= 2:
++                    return [{"bot": bot_id, "action": _move_action(path[0], path[1])}]
++                self._queue.pop(0)
++                continue
++
++            if step["kind"] == "PICK":
++                shelf = step["shelf"]
++                if abs(bot_pos[0] - shelf[0]) + abs(bot_pos[1] - shelf[1]) == 1 and len(inv) < 3:
++                    self._queue.pop(0)
++                    return [{"bot": bot_id, "action": "pick_up", "item_id": step["item_id"]}]
++                self._build_queue(state, controller, bot_pos, need)
++                return [{"bot": bot_id, "action": "wait"}]
++
++            if step["kind"] == "DROPOFF":
++                if bot_pos == controller.dropoff:
++                    self._queue.pop(0)
++                    return [{"bot": bot_id, "action": "drop_off"}]
++                self._queue[0] = {"kind": "MOVE_TO", "target": controller.dropoff}
++                continue
++
++            self._queue.pop(0)
++
++        return [{"bot": bot_id, "action": "wait"}]
++
++
++policy = NewOptimalPolicy()
+diff --git a/tests/test_optimal_one_bot_policy.py b/tests/test_optimal_one_bot_policy.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5eb6c347c89e7b65a9f7093e7782e65d2721d6a8
+--- /dev/null
++++ b/tests/test_optimal_one_bot_policy.py
+@@ -0,0 +1,63 @@
++from pathlib import Path
++import sys
++
++ROOT = Path(__file__).resolve().parents[1]
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
++
++from bot_controller import BotController
++from policies.optimal_one_bot import NewOptimalPolicy
++
++
++def test_optimal_policy_picks_adjacent_required_item():
++    policy = NewOptimalPolicy()
++    controller = BotController(policy)
++    state = {
++        "type": "game_state",
++        "round": 1,
++        "board": {"width": 6, "height": 4, "walls": []},
++        "drop_off": [5, 3],
++        "bots": [{"id": 0, "position": {"x": 1, "y": 0}, "inventory": []}],
++        "items": [
++            {"id": "a_far", "type": "A", "position": [4, 0]},
++            {"id": "b_near", "type": "B", "position": [2, 0]},
++        ],
++        "orders": [
++            {
++                "id": "order_1",
++                "status": "active",
++                "items_required": ["A", "B"],
++                "items_delivered": [],
++                "complete": False,
++            }
++        ],
++    }
++
++    action = controller.act(state)[0]
++    assert action["action"] == "pick_up"
++    assert action["item_id"] == "b_near"
++
++
++def test_optimal_policy_drops_at_dropoff_when_matching_inventory():
++    policy = NewOptimalPolicy()
++    controller = BotController(policy)
++    state = {
++        "type": "game_state",
++        "round": 10,
++        "board": {"width": 6, "height": 6, "walls": []},
++        "drop_off": [1, 1],
++        "bots": [{"id": 0, "position": {"x": 1, "y": 1}, "inventory": ["milk"]}],
++        "items": [{"id": "i1", "type": "milk", "position": [2, 1]}],
++        "orders": [
++            {
++                "id": "order_5",
++                "status": "active",
++                "items_required": ["milk"],
++                "items_delivered": [],
++                "complete": False,
++            }
++        ],
++    }
++
++    action = controller.act(state)[0]
++    assert action["action"] == "drop_off"
