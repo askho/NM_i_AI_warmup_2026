@@ -26,3 +26,18 @@ class ConstantPolicySelector:
 
     def select(self, *, difficulty: str, state: Dict[str, Any]) -> PolicyLike:
         return self.policy
+
+
+@dataclass(frozen=True)
+class BotCountPolicySelector:
+    """Select one-bot policy for solo play, and multi-bot policy otherwise."""
+
+    one_bot_policy: PolicyLike
+    multi_bot_policy: PolicyLike
+
+    def select(self, *, difficulty: str, state: Dict[str, Any]) -> PolicyLike:
+        bots = state.get("bots", []) if isinstance(state, dict) else []
+        bot_count = len(bots) if isinstance(bots, list) else 0
+        if bot_count == 1:
+            return self.one_bot_policy
+        return self.multi_bot_policy
