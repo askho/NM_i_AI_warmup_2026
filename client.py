@@ -7,8 +7,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 import json
 
 from bot_controller import BotController
-from policy_selector import PolicySelector, ConstantPolicySelector
-from policies.BFS_one_bot import policy as BFSOneBotPolicy
+from policy_selector import PolicySelector
 
 import logging
 
@@ -142,6 +141,10 @@ import json
 import websockets
 from typing import Any, Dict, Optional
 
+# type hints are optional, but nice
+from bot_controller import BotController
+from policy_selector import PolicySelector, ConstantPolicySelector
+from policies.BFS_one_bot import policy as BFSOneBotPolicy
 
 async def play(
     difficulty: str,
@@ -167,7 +170,7 @@ async def play(
 
             round_no = int(state.get("round", -1) or -1)
 
-            if 0 <= round_no < 50:
+            if 0 <= round_no < 25:
                 bots = state.get("bots", [])
                 parts = []
                 if isinstance(bots, list):
@@ -179,6 +182,8 @@ async def play(
                         if p is None:
                             continue
                         parts.append(f"{bid}@({p[0]},{p[1]})")
+                        inv = b.get("inventory", []) or []
+                        parts.append(f"{bid}@({p[0]},{p[1]}) I={len(inv)}")
                 logger.info("Bots | round=%s | %s | score=%s", round_no, " ".join(parts), state.get("score"))
 ### -------------------------------------------------
 
@@ -199,6 +204,19 @@ async def play(
             
             controller.set_policy(selector.select(difficulty=difficulty, state=state))
             actions_list = controller.act(state)
+
+            if 0 <= round_no < 25:
+                tgt = getattr(controller, "_debug_last_target", None)
+                inv_n = getattr(controller, "_debug_last_inventory_count", None)
+                if isinstance(tgt, tuple) and len(tgt) == 2:
+                    tgt_text = f"T@({tgt[0]},{tgt[1]})"
+                else:
+                    tgt_text = "T@(-,-)"
+                if isinstance(inv_n, int):
+                    inv_text = f"I={inv_n}"
+                else:
+                    inv_text = "I=?"
+                logger.info("Plan | round=%s | %s %s", round_no, tgt_text, inv_text)
 
             await ws.send(json.dumps({"actions": actions_list}))
 

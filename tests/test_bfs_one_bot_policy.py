@@ -50,6 +50,26 @@ def test_policy_picks_up_from_planned_first_shelf_not_first_allocated_type():
     assert a2[0]["item_id"] == "b_near"
 
 
+def test_policy_picks_up_when_item_positions_are_xy_dicts():
+    controller = BotController(policy)
+    s1 = _state_with_adjacent_stand()
+    s1["items"][0]["position"] = {"x": 4, "y": 0}
+    s1["items"][1]["position"] = {"x": 2, "y": 0}
+
+    a1 = controller.act(s1)
+    assert a1[0]["action"] == "move_right"
+
+    s2 = _state_with_adjacent_stand()
+    s2["round"] = 2
+    s2["bots"][0]["position"] = {"x": 1, "y": 0}
+    s2["items"][0]["position"] = {"x": 4, "y": 0}
+    s2["items"][1]["position"] = {"x": 2, "y": 0}
+
+    a2 = controller.act(s2)
+    assert a2[0]["action"] == "pick_up"
+    assert a2[0]["item_id"] == "b_near"
+
+
 def test_drop_off_only_when_on_dropoff_cell():
     controller = BotController(policy)
     state = {
@@ -72,3 +92,34 @@ def test_drop_off_only_when_on_dropoff_cell():
 
     actions = controller.act(state)
     assert actions[0]["action"] != "drop_off"
+
+
+def test_full_inventory_moves_toward_dropoff_instead_of_waiting():
+    controller = BotController(policy)
+    state = {
+        "type": "game_state",
+        "round": 1,
+        "board": {"width": 6, "height": 6, "walls": []},
+        "drop_off": [5, 5],
+        "bots": [
+            {
+                "id": 0,
+                "position": {"x": 1, "y": 1},
+                "inventory": [{"type": "X"}, {"type": "Y"}, {"type": "Z"}],
+            }
+        ],
+        "items": [{"id": "a1", "type": "A", "position": [2, 1]}],
+        "orders": [
+            {
+                "id": "o1",
+                "status": "active",
+                "items_required": ["A"],
+                "items_delivered": [],
+                "complete": False,
+            }
+        ],
+    }
+
+    actions = controller.act(state)
+    assert actions[0]["action"] in {"move_right", "move_down"}
+
