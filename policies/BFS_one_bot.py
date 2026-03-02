@@ -315,10 +315,10 @@ def decide_action_one_bot(
             return True  # if no active order found, don't block pickup/drop logic
         return need.get(t, 0) > 0
 
-    # ---- 1) DROP OFF if near dropoff and carrying something the active order needs ----
+    # ---- 1) DROP OFF only when standing on dropoff and carrying needed item(s) ----
     if active_order:
         carries_needed = any(active_needs_type(t) for t in inv_types if t is not None)
-        if carries_needed and manhattan(pos, controller.dropoff) <= 1:
+        if carries_needed and pos == controller.dropoff:
             return {"bot": bot_id, "action": "drop_off"}
 
     # ---- 2) PICK UP if near the target shelf and it is needed (and room) ----
@@ -420,16 +420,23 @@ def policy(state: Dict[str, Any], controller) -> List[Action]:
         bot=bot,
     )
 
-    # Determine target_item: prefer the first allocated item if any
+    # Determine target_item aligned with the planned first shelf, so pickup can happen.
     target_item = None
-    if allocated_items:
-        # pick the first allocated item that still exists in state
-        first_type = allocated_items[0].get("type")
-        # find a concrete item object of that type (closest match)
+    if ordered_shelves:
+        planned_shelf = tuple(ordered_shelves[0])
         for it in items:
             if not isinstance(it, dict):
                 continue
-            if it.get("type") == first_type:
+            ip = it.get("position")
+            if isinstance(ip, (list, tuple)) and len(ip) >= 2 and (int(ip[0]), int(ip[1])) == planned_shelf:
+                target_item = it
+                break
+
+    # Fallback: if no planned shelf (or item vanished), keep old behavior.
+    if target_item is None and allocated_items:
+        first_type = allocated_items[0].get("type")
+        for it in items:
+            if isinstance(it, dict) and it.get("type") == first_type:
                 target_item = it
                 break
 
