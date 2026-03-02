@@ -1,18 +1,41 @@
+# tests/test_offline_integration.py
 from __future__ import annotations
 
+import json
+import logging
+import os
 from copy import deepcopy
-from inspect import signature
 from pathlib import Path
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from bot_controller import BotController
 from policy_selector import ConstantPolicySelector
 from policies.greedy import policy as greedy_policy
-from world import World
+
+# -------------------------
+# Logging (visible in pytest with log_cli or -s)
+# -------------------------
+
+_LOG_LEVEL = os.environ.get("PYTEST_LOG_LEVEL", "DEBUG").upper()
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.DEBUG),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    force=True,  # ensure our handler is installed even if pytest configured logging earlier
+)
+logger = logging.getLogger("tests.offline_integration")
+
+# Tip: run with: pytest -q -s -o log_cli=true --log-cli-level=DEBUG
+# Or set env: PYTEST_LOG_LEVEL=INFO
+
+
+# -------------------------
+# Types / constants
+# -------------------------
 
 ALLOWED_ACTIONS = {
     "move_up",
@@ -26,130 +49,178 @@ ALLOWED_ACTIONS = {
 
 Pos = Tuple[int, int]
 Action = Dict[str, Any]
+State = Dict[str, Any]
 
 
-class OfflineControllerHarness:
+# -------------------------
+# Runtime type checking helpers
+# -------------------------
+
+def require(cond: bool, msg: str) -> None:
+    if not cond:
+        raise AssertionError(msg)
+
+
+def require_dict(x: Any, name: str) -> Dict[str, Any]:
+    require(isinstance(x, dict), f"{name} must be dict, got {type(x).__name__}")
+    return x
+
+
+def require_list(x: Any, name: str) -> List[Any]:
+    require(isinstance(x, list), f"{name} must be list, got {type(x).__name__}")
+    return x
+
+
+def require_str(x: Any, name: str) -> str:
+    require(isinstance(x, str), f"{name} must be str, got {type(x).__name__}")
+    return x
+
+
+def require_int(x: Any, name: str) -> int:
+    require(isinstance(x, int), f"{name} must be int, got {type(x).__name__}")
+    return x
+
+
+def require_pos(x: Any, name: str) -> Pos:
+    require(isinstance(x, tuple) and len(x) == 2, f"{name} must be Pos tuple(len=2), got {x!r}")
+    require(isinstance(x[0], int) and isinstance(x[1], int), f"{name} must be (int,int), got {x!r}")
+    return x  # type: ignore[return-value]
+
+
+def require_action_dict(a: Any, name: str = "action") -> Action:
+    require(isinstance(a, dict), f"{name} must be dict, got {type(a).__name__}")
+    require("bot" in a and "action" in a, f"{name} must include keys 'bot' and 'action', got keys={list(a.keys())}")
+    require(isinstance(a["action"], str), f"{name}['action'] must be str, got {type(a['action']).__name__}")
+    require(a["action"] in ALLOWED_ACTIONS, f"{name}['action'] must be allowed, got {a['action']!r}")
+    if a["action"] == "pick_up":
+        require(isinstance(a.get("item_id"), str), f"{name} pick_up must include item_id: str")
+    require(set(a.keys()).issubset({"bot", "action", "item_id"}), f"{name} has extra keys: {set(a.keys())}")
+    return a
+
+
+def validate_controller_members(controller: Any) -> None:
+    require(isinstance(controller, BotController), f"controller must be BotController, got {type(controller).__name__}")
+    # These are the new member vars from your refactor
+    require(isinstance(controller.initialized, bool), "controller.initialized must be bool")
+    require(isinstance(controller.width, int), "controller.width must be int")
+    require(isinstance(controller.height, int), "controller.height must be int")
+    require(isinstance(controller.walls, set), "controller.walls must be set")
+    require(isinstance(controller.dropoff, tuple), "controller.dropoff must be tuple")
+    require(isinstance(controller.bots, list), "controller.bots must be list")
+    require(isinstance(controller.bots_by_id, dict), "controller.bots_by_id must be dict")
+
+
+# -------------------------
+# State normalization + validation
+# -------------------------
+
+def _pos_to_xy_dict(p: Any) -> Any:
+    """Convert [x,y]/(x,y) into {'x': x, 'y': y}. Leave dicts unchanged."""
+    if isinstance(p, dict):
+        if "position" in p and isinstance(p["position"], (list, tuple, dict)):
+            return _pos_to_xy_dict(p["position"])
+        return p
+    if isinstance(p, (list, tuple)) and len(p) >= 2:
+        return {"x": int(p[0]), "y": int(p[1])}
+    return p
+
+
+def normalize_state_for_controller(state: State) -> State:
     """
-    Tiny controller harness used by these offline integration tests.
-
-    The repository currently does not expose a BotController class, so this harness
-    mirrors the expected BotController.act/set_policy behavior for integration checks
-    across selector + policy + controller arbitration guarantees.
+    Normalizes older/offline shapes to what BotController expects:
+      - grid -> board
+      - bot/item positions as [x,y] -> {'x','y'}
+      - keeps everything else the same
     """
+    require_dict(state, "state")
+    s = deepcopy(state)
 
-    def __init__(self, policy=None, max_inventory: int = 3) -> None:
-        self.policy = policy
-        self.max_inventory = max_inventory
-        self.world: World | None = None
+    # grid -> board
+    if "board" not in s and isinstance(s.get("grid"), dict):
+        g = require_dict(s["grid"], "state['grid']")
+        s["board"] = {
+            "width": g.get("width", 1),
+            "height": g.get("height", 1),
+            "walls": g.get("walls", []),
+        }
 
-    def set_policy(self, policy) -> None:
-        self.policy = policy
+    # board sanity
+    board = require_dict(s.get("board", {}), "state['board']")
+    require("width" in board and "height" in board, "state['board'] must have width and height")
+    require(isinstance(board["width"], (int, float)), "state['board']['width'] must be numeric")
+    require(isinstance(board["height"], (int, float)), "state['board']['height'] must be numeric")
+    if "walls" in board:
+        require(isinstance(board["walls"], list), "state['board']['walls'] must be a list")
 
-    def is_free_static(self, pos: Pos) -> bool:
-        return bool(self.world) and self.world.is_free_static(pos)
+    # normalize bots positions
+    bots = s.get("bots", [])
+    if isinstance(bots, list):
+        for i, b in enumerate(bots):
+            require(isinstance(b, dict), f"state['bots'][{i}] must be dict")
+            require("id" in b, f"state['bots'][{i}] missing 'id'")
+            if "position" in b:
+                b["position"] = _pos_to_xy_dict(b["position"])
 
-    def move_toward(self, bot_id: int, pos: Pos, target: Pos, blocked_positions: set[Pos] | None = None) -> Action:
-        blocked_positions = blocked_positions or set()
+    # normalize items positions
+    items = s.get("items", [])
+    if isinstance(items, list):
+        for i, it in enumerate(items):
+            require(isinstance(it, dict), f"state['items'][{i}] must be dict")
+            if "position" in it:
+                it["position"] = _pos_to_xy_dict(it["position"])
 
-        x, y = pos
-        tx, ty = target
-
-        candidates: List[Tuple[str, Pos]] = []
-        if tx > x:
-            candidates.append(("move_right", (x + 1, y)))
-        elif tx < x:
-            candidates.append(("move_left", (x - 1, y)))
-
-        if ty > y:
-            candidates.append(("move_down", (x, y + 1)))
-        elif ty < y:
-            candidates.append(("move_up", (x, y - 1)))
-
-        for action, nxt in candidates:
-            if self.world and self.world.is_free_static(nxt) and nxt not in blocked_positions:
-                return {"bot": bot_id, "action": action}
-
-        return {"bot": bot_id, "action": "wait"}
-
-    def _call_policy(self, state: Dict[str, Any]) -> List[Action]:
-        if self.policy is None:
-            return []
-
-        params = len(signature(self.policy).parameters)
-        if params >= 2:
-            result = self.policy(state, self)
-        else:
-            result = self.policy(state)
-        return result if isinstance(result, list) else []
-
-    def act(self, state: Dict[str, Any]) -> List[Action]:
-        grid = state.get("grid", {})
-        walls = {tuple(w) for w in grid.get("walls", [])}
-        self.world = World(
-            width=int(grid.get("width", 0)),
-            height=int(grid.get("height", 0)),
-            walls=walls,
-            drop_off=tuple(state.get("drop_off", [0, 0])),
-        )
-
-        bots = state.get("bots", [])
-        bot_order = [b["id"] for b in bots]
-        bot_positions = {b["id"]: tuple(b["position"]) for b in bots}
-
-        raw = self._call_policy(state)
-        raw_by_bot = {a.get("bot"): a for a in raw if isinstance(a, dict) and isinstance(a.get("bot"), int)}
-
-        actions: List[Action] = []
-        reserved_destinations: set[Pos] = set()
-
-        for bot_id in bot_order:
-            candidate = raw_by_bot.get(bot_id, {"bot": bot_id, "action": "wait"})
-            action = candidate.get("action")
-
-            if action not in ALLOWED_ACTIONS:
-                actions.append({"bot": bot_id, "action": "wait"})
-                continue
-
-            if action == "pick_up" and not isinstance(candidate.get("item_id"), str):
-                actions.append({"bot": bot_id, "action": "wait"})
-                continue
-
-            if action.startswith("move_"):
-                curr = bot_positions[bot_id]
-                nxt = next_cell(curr, action)
-                if not self.world.is_free_static(nxt):
-                    actions.append({"bot": bot_id, "action": "wait"})
-                    continue
-                if nxt in reserved_destinations:
-                    actions.append({"bot": bot_id, "action": "wait"})
-                    continue
-                reserved_destinations.add(nxt)
-
-            sanitized = {"bot": bot_id, "action": action}
-            if action == "pick_up":
-                sanitized["item_id"] = candidate["item_id"]
-            actions.append(sanitized)
-
-        return actions
+    return s
 
 
-def make_minimal_state() -> Dict[str, Any]:
+def validate_state_minimum(state: State) -> None:
+    """Checks that the state shape we pass between selector -> controller -> policy is sane."""
+    require_dict(state, "state")
+    require(state.get("type") == "game_state", f"state['type'] must be 'game_state', got {state.get('type')!r}")
+
+    board = require_dict(state.get("board", {}), "state['board']")
+    require(isinstance(board.get("width"), (int, float)), "board.width must be numeric")
+    require(isinstance(board.get("height"), (int, float)), "board.height must be numeric")
+    require(isinstance(board.get("walls", []), list), "board.walls must be list")
+
+    bots = require_list(state.get("bots", []), "state['bots']")
+    for i, b in enumerate(bots):
+        require(isinstance(b, dict), f"bots[{i}] must be dict")
+        require("id" in b, f"bots[{i}] missing id")
+        pos = b.get("position")
+        require(isinstance(pos, dict), f"bots[{i}].position must be dict {{x,y}} after normalization")
+        require(isinstance(pos.get("x"), (int, float)), f"bots[{i}].position.x must be numeric")
+        require(isinstance(pos.get("y"), (int, float)), f"bots[{i}].position.y must be numeric")
+
+
+# -------------------------
+# State helpers
+# -------------------------
+
+def load_state_from_data_json() -> Optional[State]:
+    path = ROOT / "data.json"
+    if not path.exists():
+        logger.warning("No data.json found at %s; falling back to minimal state.", path)
+        return None
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    require(isinstance(data, dict), f"data.json must contain a dict at top-level, got {type(data).__name__}")
+    logger.info("Loaded data.json (%s bytes) keys=%s", path.stat().st_size, sorted(data.keys()))
+    return data  # type: ignore[return-value]
+
+
+def make_minimal_state() -> State:
     return {
         "type": "game_state",
         "round": 1,
-        "grid": {
-            "width": 5,
-            "height": 5,
-            "walls": [],
-        },
+        "board": {"width": 5, "height": 5, "walls": []},
         "drop_off": [4, 4],
         "bots": [
-            {"id": 0, "position": [0, 1], "inventory": []},
-            {"id": 1, "position": [2, 1], "inventory": []},
-            {"id": 2, "position": [4, 1], "inventory": []},
+            {"id": 0, "position": {"x": 0, "y": 1}, "inventory": []},
+            {"id": 1, "position": {"x": 2, "y": 1}, "inventory": []},
+            {"id": 2, "position": {"x": 4, "y": 1}, "inventory": []},
         ],
         "items": [
-            {"id": "item-apple-1", "type": "apple", "position": [1, 3]},
+            {"id": "item-apple-1", "type": "apple", "position": {"x": 1, "y": 3}},
         ],
         "orders": [
             {
@@ -162,22 +233,29 @@ def make_minimal_state() -> Dict[str, Any]:
     }
 
 
-def assert_actions_schema(actions: List[Action], num_bots: int) -> None:
-    assert isinstance(actions, list)
-    assert len(actions) == num_bots
+def bot_ids_from_state(state: State) -> List[str]:
+    bots = require_list(state.get("bots", []), "state['bots']")
+    ids: List[str] = []
+    for b in bots:
+        require(isinstance(b, dict), "bot must be dict")
+        require("id" in b, "bot missing id")
+        ids.append(str(b["id"]))
+    return ids
 
-    seen_bots = set()
-    for a in actions:
-        assert isinstance(a, dict)
-        assert set(a.keys()).issubset({"bot", "action", "item_id"})
-        assert "bot" in a and "action" in a
-        assert isinstance(a["bot"], int)
-        assert a["bot"] not in seen_bots
-        seen_bots.add(a["bot"])
 
-        assert a["action"] in ALLOWED_ACTIONS
-        if a["action"] == "pick_up":
-            assert isinstance(a.get("item_id"), str)
+def assert_actions_schema(actions: Any, expected_bot_ids: List[str]) -> None:
+    require(isinstance(actions, list), f"actions must be list, got {type(actions).__name__}")
+    require(len(actions) == len(expected_bot_ids), f"expected {len(expected_bot_ids)} actions, got {len(actions)}")
+
+    expected_set = set(expected_bot_ids)
+    seen: set[str] = set()
+
+    for i, a in enumerate(actions):
+        a = require_action_dict(a, name=f"actions[{i}]")
+        bot_id = str(a["bot"])
+        require(bot_id in expected_set, f"actions[{i}].bot={bot_id!r} not in expected ids={sorted(expected_set)}")
+        require(bot_id not in seen, f"duplicate bot id in actions: {bot_id!r}")
+        seen.add(bot_id)
 
 
 def next_cell(pos: Pos, action: str) -> Pos:
@@ -193,66 +271,124 @@ def next_cell(pos: Pos, action: str) -> Pos:
     return pos
 
 
+def bot_pos_map(state: State) -> Dict[str, Pos]:
+    out: Dict[str, Pos] = {}
+    bots = require_list(state.get("bots", []), "state['bots']")
+    for b in bots:
+        require(isinstance(b, dict), "bot must be dict")
+        bot_id = str(b.get("id"))
+        pos = require_dict(b.get("position", {}), f"bot[{bot_id}].position")
+        x = int(pos.get("x", 0) or 0)
+        y = int(pos.get("y", 0) or 0)
+        out[bot_id] = (x, y)
+    return out
+
+
+# -------------------------
+# Tests
+# -------------------------
+
 def test_greedy_policy_integration_smoke() -> None:
-    state = make_minimal_state()
+    state = load_state_from_data_json() or make_minimal_state()
+    state = normalize_state_for_controller(state)
+    validate_state_minimum(state)
 
-    controller = OfflineControllerHarness()
+    controller = BotController()
+    validate_controller_members(controller)
+
     selector = ConstantPolicySelector(greedy_policy)
+    selected = selector.select(difficulty="easy", state=state)
 
-    controller.set_policy(selector.select(difficulty="easy", state=state))
+    require(callable(selected), "selector.select(...) must return a callable policy")
+    controller.set_policy(selected)
+
+    logger.info("Running act() | bots=%d", len(state["bots"]))
     actions = controller.act(state)
 
-    assert_actions_schema(actions, num_bots=len(state["bots"]))
+    validate_controller_members(controller)
+    logger.info(
+        "Controller members | initialized=%s size=%dx%d walls=%d dropoff=%s",
+        controller.initialized,
+        controller.width,
+        controller.height,
+        len(controller.walls),
+        controller.dropoff,
+    )
+    logger.info("Actions: %s", actions)
+
+    assert_actions_schema(actions, expected_bot_ids=bot_ids_from_state(state))
 
 
 def test_controller_does_not_mutate_input_state() -> None:
-    state = make_minimal_state()
+    state = normalize_state_for_controller(make_minimal_state())
+    validate_state_minimum(state)
     before = deepcopy(state)
 
-    controller = OfflineControllerHarness(greedy_policy)
+    controller = BotController(greedy_policy)
+    validate_controller_members(controller)
+
+    logger.info("Running act() for mutation check")
     _ = controller.act(state)
 
-    assert state == before
+    require(state == before, "Controller mutated input state")
 
 
 def test_controller_sanitizes_invalid_and_out_of_bounds_actions() -> None:
-    state = make_minimal_state()
+    state = normalize_state_for_controller(make_minimal_state())
+    validate_state_minimum(state)
 
-    def bad_policy(_state: Dict[str, Any]) -> List[Action]:
+    def bad_policy(_state: Dict[str, Any], _controller: BotController) -> List[Action]:
+        # Type checks at the boundary
+        require_dict(_state, "bad_policy.state")
+        require(isinstance(_controller, BotController), "bad_policy.controller must be BotController")
         return [
             {"bot": 0, "action": "move_left"},  # OOB from x=0
-            {"bot": 1, "action": "teleport"},  # unknown action
-            # bot 2 missing
+            {"bot": 1, "action": "teleport"},   # unknown action
+            # bot 2 missing -> should become wait
         ]
 
-    controller = OfflineControllerHarness(bad_policy)
-    actions = controller.act(state)
+    controller = BotController(bad_policy)
+    validate_controller_members(controller)
 
-    assert_actions_schema(actions, num_bots=3)
-    assert actions == [
-        {"bot": 0, "action": "wait"},
-        {"bot": 1, "action": "wait"},
-        {"bot": 2, "action": "wait"},
-    ]
+    logger.info("Running act() for sanitization test")
+    actions = controller.act(state)
+    logger.info("Actions: %s", actions)
+
+    assert_actions_schema(actions, expected_bot_ids=bot_ids_from_state(state))
+
+    got = {str(a["bot"]): a["action"] for a in actions}
+    require(got == {"0": "wait", "1": "wait", "2": "wait"}, f"Unexpected sanitized actions: {got}")
 
 
 def test_conflict_resolution_no_duplicate_destinations() -> None:
-    state = make_minimal_state()
+    state = normalize_state_for_controller(make_minimal_state())
+    validate_state_minimum(state)
 
-    def colliding_policy(_state: Dict[str, Any]) -> List[Action]:
+    def colliding_policy(_state: Dict[str, Any], _controller: BotController) -> List[Action]:
+        require_dict(_state, "colliding_policy.state")
+        require(isinstance(_controller, BotController), "colliding_policy.controller must be BotController")
         return [
             {"bot": 0, "action": "move_right"},  # -> (1,1)
-            {"bot": 1, "action": "move_left"},  # -> (1,1), conflict
+            {"bot": 1, "action": "move_left"},   # -> (1,1), conflict
             {"bot": 2, "action": "wait"},
         ]
 
-    controller = OfflineControllerHarness(colliding_policy)
+    controller = BotController(colliding_policy)
+    validate_controller_members(controller)
+
+    logger.info("Running act() for conflict-resolution test")
     actions = controller.act(state)
+    logger.info("Actions: %s", actions)
 
-    assert_actions_schema(actions, num_bots=3)
+    assert_actions_schema(actions, expected_bot_ids=bot_ids_from_state(state))
 
-    bot_pos = {b["id"]: tuple(b["position"]) for b in state["bots"]}
-    destinations = [next_cell(bot_pos[a["bot"]], a["action"]) for a in actions if a["action"].startswith("move_")]
+    bot_pos = bot_pos_map(state)
+    destinations = [
+        next_cell(require_pos(bot_pos[str(a["bot"])], "bot_pos"), require_str(a["action"], "action"))
+        for a in actions
+        if isinstance(a.get("action"), str) and a["action"].startswith("move_")
+    ]
 
-    assert len(destinations) == len(set(destinations))
-    assert destinations.count((1, 1)) <= 1
+    logger.info("Destinations: %s", destinations)
+    require(len(destinations) == len(set(destinations)), f"Duplicate destinations found: {destinations}")
+    require(destinations.count((1, 1)) <= 1, f"Too many bots moving into (1,1): {destinations}")

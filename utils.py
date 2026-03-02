@@ -18,3 +18,18 @@ def build_walls_set(state: Dict[str, Any]) -> Set[Pos]:
 def get_bot_positions(state) -> Set[Pos]:
     return {(b["position"][0], b["position"][1]) for b in state["bots"]}
 
+def build_item_positions_by_type(state):
+    """
+    Returns: { "cheese": [[3,2],[3,4]], "butter": [[5,2],[5,4]], ... }
+    """
+    out = {}
+    for item in state.get("items"):
+        type = item.get("type")
+
+        if type not in out:
+            out[type] = []
+
+        out[type].append(item["position"])
+        
+    return dict(out)
+

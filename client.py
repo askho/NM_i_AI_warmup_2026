@@ -7,13 +7,10 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 import json
 
 from bot_controller import BotController
-from policy_selector import PolicySelector
+from policy_selector import PolicySelector, ConstantPolicySelector
+from policies.BFS_one_bot import policy as BFSOneBotPolicy
 
 import logging
-
-
-
-
 
 logger = logging.getLogger(__name__)
 
@@ -145,10 +142,6 @@ import json
 import websockets
 from typing import Any, Dict, Optional
 
-# type hints are optional, but nice
-from bot_controller import BotController
-from policy_selector import PolicySelector, ConstantPolicySelector
-
 
 async def play(
     difficulty: str,
@@ -156,9 +149,38 @@ async def play(
     controller: BotController,
     selector: PolicySelector,
 ) -> None:
+    
+    #raise SystemExit(0) # temp while testing main.py without running the game loop
+
     async with websockets.connect(WS_URL) as ws:
         while True:
             state: Dict[str, Any] = json.loads(await ws.recv())
+### testing/debugging: log bot positions each round
+            def _pos_xy(pos):
+                # supports {"x":..,"y":..} and [x,y]
+                if isinstance(pos, dict):
+                    return int(pos.get("x", 0) or 0), int(pos.get("y", 0) or 0)
+                if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+                    return int(pos[0]), int(pos[1])
+                return None
+
+
+            round_no = int(state.get("round", -1) or -1)
+
+            if 0 <= round_no < 50:
+                bots = state.get("bots", [])
+                parts = []
+                if isinstance(bots, list):
+                    for b in bots:
+                        if not isinstance(b, dict):
+                            continue
+                        bid = b.get("id")
+                        p = _pos_xy(b.get("position"))
+                        if p is None:
+                            continue
+                        parts.append(f"{bid}@({p[0]},{p[1]})")
+                logger.info("Bots | round=%s | %s | score=%s", round_no, " ".join(parts), state.get("score"))
+### -------------------------------------------------
 
             msg_type = state.get("type")
             if msg_type == "game_over":
@@ -167,7 +189,14 @@ async def play(
             if msg_type != "game_state":
                 # ignore unexpected message types safely
                 continue
-
+            bots = state.get("bots", [])
+            if bots:
+                b0 = bots[0]
+                logger.debug("BOT0 | round=%s pos=%s inv=%s",
+                            state.get("round"),
+                            b0.get("position"),
+                            b0.get("inventory"))
+            
             controller.set_policy(selector.select(difficulty=difficulty, state=state))
             actions_list = controller.act(state)
 
@@ -182,9 +211,9 @@ def start_game(
     WS_URL = get_ws_url(difficulty)
     # Provide sane defaults so client.py can be run standalone
     if controller is None:
-        controller = BotController(policy=None)
+        controller = BotController(policy=BFSOneBotPolicy)
     if selector is None:
-        selector = ConstantPolicySelector(lambda state: [])
+        selector = ConstantPolicySelector(BFSOneBotPolicy)
 
     logger.info(f"Starting game | difficulty={difficulty}")
     asyncio.run(play(difficulty, WS_URL, controller, selector))

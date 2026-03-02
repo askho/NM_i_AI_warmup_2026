@@ -7,6 +7,7 @@ Pos = tuple[int, int]
 
 
 def neighbors4(p: Pos) -> Iterable[Pos]:
+    # Returns the 4 orthogonal neighbors of p (up, down, left, right).
     x, y = p
     yield (x + 1, y)
     yield (x - 1, y)
@@ -29,6 +30,7 @@ def is_free_cell(
     if p in blocked:
         return False
     return True
+
 
 
 def bfs_path(
