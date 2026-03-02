@@ -7,6 +7,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 import json
 
 from bot_controller import BotController
+from logging_utils import log_game_over, log_round_snapshot
 from policy_selector import PolicySelector
 
 import logging
@@ -137,12 +138,8 @@ def get_ws_url(difficulty: str, headless: bool = True) -> str:
         return ws_url
 
 
-import json
-import websockets
 from typing import Any, Dict, Optional
 
-# type hints are optional, but nice
-from bot_controller import BotController
 from policy_selector import PolicySelector, ConstantPolicySelector
 from policies.BFS_one_bot import policy as BFSOneBotPolicy
 
@@ -152,83 +149,34 @@ async def play(
     controller: BotController,
     selector: PolicySelector,
 ) -> None:
-    
-    #raise SystemExit(0) # temp while testing main.py without running the game loop
-
+    logger.info("Connecting to game websocket", extra={"is_game_trace": True})
     async with websockets.connect(WS_URL) as ws:
         while True:
             state: Dict[str, Any] = json.loads(await ws.recv())
-### testing/debugging: log bot positions each round
-            def _pos_xy(pos):
-                # supports {"x":..,"y":..} and [x,y]
-                if isinstance(pos, dict):
-                    return int(pos.get("x", 0) or 0), int(pos.get("y", 0) or 0)
-                if isinstance(pos, (list, tuple)) and len(pos) >= 2:
-                    return int(pos[0]), int(pos[1])
-                return None
-
-
-            round_no = int(state.get("round", -1) or -1)
-
-            if 0 <= round_no < 25:
-                bots = state.get("bots", [])
-                parts = []
-                if isinstance(bots, list):
-                    for b in bots:
-                        if not isinstance(b, dict):
-                            continue
-                        bid = b.get("id")
-                        p = _pos_xy(b.get("position"))
-                        if p is None:
-                            continue
-                        parts.append(f"{bid}@({p[0]},{p[1]})")
-                        inv = b.get("inventory", []) or []
-                        parts.append(f"{bid}@({p[0]},{p[1]}) I={len(inv)}")
-                logger.info(
-                    "Bots | round=%s | %s | score=%s",
-                    round_no,
-                    " ".join(parts),
-                    state.get("score"),
-                    extra={"is_round_summary": True, "round_no": round_no},
-                )
-### -------------------------------------------------
-
             msg_type = state.get("type")
+
             if msg_type == "game_over":
+                log_game_over(logger, state)
                 break
 
             if msg_type != "game_state":
-                # ignore unexpected message types safely
+                logger.info("Ignoring non-game state message type=%s", msg_type, extra={"is_game_trace": True})
                 continue
-            bots = state.get("bots", [])
-            if bots:
-                b0 = bots[0]
-                logger.debug("BOT0 | round=%s pos=%s inv=%s",
-                            state.get("round"),
-                            b0.get("position"),
-                            b0.get("inventory"))
-            
+
             controller.set_policy(selector.select(difficulty=difficulty, state=state))
             actions_list = controller.act(state)
 
-            if 0 <= round_no < 25:
-                tgt = getattr(controller, "_debug_last_target", None)
-                inv_n = getattr(controller, "_debug_last_inventory_count", None)
-                if isinstance(tgt, tuple) and len(tgt) == 2:
-                    tgt_text = f"T@({tgt[0]},{tgt[1]})"
-                else:
-                    tgt_text = "T@(-,-)"
-                if isinstance(inv_n, int):
-                    inv_text = f"I={inv_n}"
-                else:
-                    inv_text = "I=?"
-                logger.info(
-                    "Plan | round=%s | %s %s",
-                    round_no,
-                    tgt_text,
-                    inv_text,
-                    extra={"is_round_summary": True, "round_no": round_no},
-                )
+            plan_target = getattr(controller, "_debug_last_target", None)
+            inv_count = getattr(controller, "_debug_last_inventory_count", None)
+            logger.info(
+                "Plan round=%s target=%s inv=%s actions=%s",
+                state.get("round"),
+                plan_target,
+                inv_count,
+                actions_list,
+                extra={"is_round_summary": True, "is_game_trace": True, "round_no": int(state.get("round", -1) or -1)},
+            )
+            log_round_snapshot(logger, state, action_count=len(actions_list))
 
             await ws.send(json.dumps({"actions": actions_list}))
 

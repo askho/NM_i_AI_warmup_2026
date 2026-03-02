@@ -1,13 +1,11 @@
-# policies/greedy.py
 from __future__ import annotations
 
-import logging
 import itertools
-from collections import Counter, deque
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
-from planning.assignments import allocate_items
-from planning.pathfinding import bfs_path, is_free_cell, neighbors4
+import logging
+from collections import Counter
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from planning.pathfinding import bfs_path, neighbors4
 
 logger = logging.getLogger("policy.BFS_one_bot")
 
@@ -33,7 +31,6 @@ def _to_pos(p: Any) -> Optional[Pos]:
 
 
 def _order_sequence(order: Dict[str, Any], fallback_index: int = -1) -> int:
-    """Extract numeric order sequence from ids like 'order_12'."""
     raw_id = str(order.get("id", ""))
     suffix = raw_id.rsplit("_", 1)[-1]
     try:
@@ -43,12 +40,6 @@ def _order_sequence(order: Dict[str, Any], fallback_index: int = -1) -> int:
 
 
 def _select_active_order(orders: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Pick the current active order robustly as order ids increase.
-
-    Prefers the highest-sequence ACTIVE and not-complete order.
-    Falls back to highest-sequence ACTIVE order if `complete` flags are inconsistent.
-    """
     indexed = [
         (i, o)
         for i, o in enumerate(orders or [])
@@ -56,7 +47,6 @@ def _select_active_order(orders: Sequence[Dict[str, Any]]) -> Optional[Dict[str,
     ]
     if not indexed:
         return None
-
     non_complete = [(i, o) for i, o in indexed if not bool(o.get("complete", False))]
     candidates = non_complete or indexed
     _, best = max(candidates, key=lambda io: _order_sequence(io[1], io[0]))
@@ -74,404 +64,154 @@ def _remaining_need_counts(order: Optional[Dict[str, Any]]) -> Counter:
     return Counter({k: v for k, v in need.items() if v > 0})
 
 
+def _move_action(from_pos: Pos, to_pos: Pos) -> str:
+    dx = to_pos[0] - from_pos[0]
+    dy = to_pos[1] - from_pos[1]
+    if dx == 1 and dy == 0:
+        return "move_right"
+    if dx == -1 and dy == 0:
+        return "move_left"
+    if dx == 0 and dy == 1:
+        return "move_down"
+    if dx == 0 and dy == -1:
+        return "move_up"
+    return "wait"
+
+
+def _bfs_to_nearest(start: Pos, goals: set[Pos], controller, obstacles: set[Pos]) -> List[Pos]:
+    if start in goals:
+        return [start]
+    best: List[Pos] = []
+    for g in goals:
+        p = bfs_path(start, g, width=controller.width, height=controller.height, walls=set(getattr(controller, "walls", set())), blocked=set(obstacles))
+        if p and (not best or len(p) < len(best)):
+            best = p
+    return best
+
+
 def plan_item_run(state, controller, item_types, walls, blocked, bot):
-    """
-    Single-bot planner (recomputed every round).
-
-    Inputs:
-      - item_types: list with 1–3 requested item types (may include duplicates)
-      - walls: iterable of (x,y)
-      - blocked: iterable of (x,y) (often includes items + bots)
-      - bot: this bot dict
-
-    Returns:
-      (ordered_item_positions, path_to_first_stand_cell)
-
-    Meaning:
-      - ordered_item_positions: shelf positions (x,y) in the best visiting order
-      - path_to_first_stand_cell: BFS path from current bot position to a *stand cell*
-        (Manhattan-distance 1) from the first shelf in the plan.
-
-    Notes:
-      - Ignores other bots as obstacles (even if `blocked` includes them).
-      - Treats shelf cells as blocked; you navigate to an adjacent stand cell.
-      - Includes a final leg in the cost: end on a stand cell adjacent to dropoff.
-      - If duplicates exist in item_types, we only visit that type once (can pick multiple from same shelf).
-    """
-
-    def as_pos(p):
-        q = _to_pos(p)
-        if q is None:
-            return (0, 0)
-        return q
-
-    def bot_pos(b):
-        p = b.get("position", b)
-        if isinstance(p, dict):
-            return (int(p.get("x", 0) or 0), int(p.get("y", 0) or 0))
-        return (int(p[0]), int(p[1]))
-
-    def path_len(path):
-        return max(0, len(path) - 1)
-
-    def bfs(start, goal, obstacles):
-        if start == goal:
-            return [start]
-        q = deque([start])
-        prev = {start: None}
-        while q:
-            cur = q.popleft()
-            for nxt in neighbors4(cur):
-                if nxt in prev:
-                    continue
-                if not controller.in_bounds(nxt):
-                    continue
-                if nxt in obstacles:
-                    continue
-                prev[nxt] = cur
-                if nxt == goal:
-                    # reconstruct
-                    out = [nxt]
-                    while out[-1] is not None:
-                        out.append(prev[out[-1]])
-                    out.pop()          # remove None
-                    out.reverse()
-                    return out
-                q.append(nxt)
-        return []
-
-    # ---- dedupe types (preserve order) ----
-    types = []
+    types: List[str] = []
     for t in item_types:
-        if t not in types:
-            types.append(t)
+        if t and t not in types:
+            types.append(str(t))
+    if not types:
+        return [], []
 
-    # ---- obstacles: walls + blocked, but remove ALL bot positions (ignore other bots) ----
-    obstacles = set(as_pos(p) for p in walls) | set(as_pos(p) for p in blocked)
+    bot_pos = _to_pos(bot.get("position")) or (0, 0)
+    obstacles = {p for p in (_to_pos(x) for x in (list(walls) + list(blocked))) if p is not None}
+    obstacles.discard(bot_pos)
 
-    for b in state.get("bots", []):
-        if isinstance(b, dict) and b is not bot:
-            obstacles.discard(bot_pos(b))
-
-    start = bot_pos(bot)
-    obstacles.discard(start)
-
-    # ---- group shelves by type ----
-    shelves_by_type = {}
+    shelves_by_type: Dict[str, List[Pos]] = {}
     for item in state.get("items", []):
-        t = item.get("type")
-        p = item.get("position")
-        if t is None or p is None:
+        if not isinstance(item, dict):
             continue
-        shelves_by_type.setdefault(t, []).append(as_pos(p))
+        itype = item.get("type")
+        ipos = _to_pos(item.get("position"))
+        if itype is None or ipos is None:
+            continue
+        shelves_by_type.setdefault(str(itype), []).append(ipos)
 
-    # ---- for each type: list of options (shelf_pos, stand_pos) ----
-    options_by_type = {}
+    options: Dict[str, List[Tuple[Pos, Pos]]] = {}
     for t in types:
-        opts = []
+        opts: List[Tuple[Pos, Pos]] = []
         for shelf in shelves_by_type.get(t, []):
-            # stand cells are free adjacent cells to the shelf
             for stand in neighbors4(shelf):
-                if not controller.in_bounds(stand):
-                    continue
-                if stand in obstacles:
-                    continue
-                opts.append((shelf, stand))
-        options_by_type[t] = opts
+                if controller.in_bounds(stand) and stand not in obstacles:
+                    opts.append((shelf, stand))
         if not opts:
             return [], []
+        options[t] = opts
 
-    # ---- dropoff stand cells (used only for scoring) ----
-    drop = controller.dropoff
-    drop_stands = [p for p in neighbors4(drop) if controller.in_bounds(p) and p not in obstacles]
+    drop_stands = {p for p in neighbors4(controller.dropoff) if controller.in_bounds(p) and p not in obstacles}
     if not drop_stands:
         return [], []
 
     best_total = None
-    best_perm = None
     best_choice = None
-    best_first_path = None
+    best_first = []
 
-    # types ≤ 3 → brute force is fine
     for perm in itertools.permutations(types, len(types)):
-        per_type_opts = [options_by_type[t] for t in perm]
-
-        for choice in itertools.product(*per_type_opts):
-            cur = start
-            total = 0
-            first_path = None
-
+        for choice in itertools.product(*(options[t] for t in perm)):
+            cur = bot_pos
+            total_steps = 0
+            first_path: List[Pos] = []
             ok = True
-            for i, (shelf, stand) in enumerate(choice):
-                pth = bfs(cur, stand, obstacles)
-                if not pth:
+            for idx, (_shelf, stand) in enumerate(choice):
+                p = bfs_path(cur, stand, width=controller.width, height=controller.height, walls=set(getattr(controller, "walls", set())), blocked=set(obstacles))
+                if not p:
                     ok = False
                     break
-                if i == 0:
-                    first_path = pth
-                total += path_len(pth)
+                if idx == 0:
+                    first_path = p
+                total_steps += len(p) - 1
                 cur = stand
-
             if not ok:
                 continue
 
-            # add cost to end adjacent to dropoff
-            best_drop_cost = None
-            for dstand in drop_stands:
-                dpth = bfs(cur, dstand, obstacles)
-                if not dpth:
-                    continue
-                c = path_len(dpth)
-                if best_drop_cost is None or c < best_drop_cost:
-                    best_drop_cost = c
-
-            if best_drop_cost is None:
+            to_drop = _bfs_to_nearest(cur, drop_stands, controller, obstacles)
+            if not to_drop:
                 continue
+            total_steps += len(to_drop) - 1
 
-            total += best_drop_cost
-
-            if best_total is None or total < best_total:
-                best_total = total
-                best_perm = perm
+            if best_total is None or total_steps < best_total:
+                best_total = total_steps
                 best_choice = choice
-                best_first_path = first_path
+                best_first = first_path
 
-    if best_choice is None:
+    if not best_choice:
         return [], []
+    return [shelf for shelf, _ in best_choice], best_first
 
-    ordered_shelves = [shelf for (shelf, _stand) in best_choice]
-    return ordered_shelves, (best_first_path or [])
 
-def extract_target_item_id(
-    state,
-    adjacent_block,
-    allocated_itemtype,
-    item_positions_by_type,
-):
-    """
-    Find the concrete item_id to pick up.
+def _pick_item_if_adjacent(bot: Dict[str, Any], target_item: Optional[Dict[str, Any]], need: Counter) -> Optional[Action]:
+    if not isinstance(target_item, dict):
+        return None
+    item_pos = _to_pos(target_item.get("position"))
+    bot_pos = _to_pos(bot.get("position")) or (0, 0)
+    if item_pos is None:
+        return None
+    if abs(bot_pos[0] - item_pos[0]) + abs(bot_pos[1] - item_pos[1]) != 1:
+        return None
+    if len(bot.get("inventory", []) or []) >= 3:
+        return None
+    t = str(target_item.get("type"))
+    if need and need.get(t, 0) <= 0:
+        return None
+    return {"bot": bot.get("id"), "action": "pick_up", "item_id": target_item.get("id")}
 
-    adjacent_block: the bot's current (or planned) stand cell (x,y)
-    allocated_itemtype: e.g. "milk"
-    item_positions_by_type: {"milk": [[5,3], ...], ...}
 
-    Returns: item_id string, or None if nothing of that type is adjacent.
-    """
+def _inventory_types(inv: List[Any]) -> List[str]:
+    out: List[str] = []
+    for it in inv or []:
+        if isinstance(it, str):
+            out.append(it)
+        elif isinstance(it, dict) and it.get("type"):
+            out.append(str(it.get("type")))
+    return out
 
-    def to_pos(p):
-        return (int(p[0]), int(p[1]))
-
-    adj = set(neighbors4(adjacent_block))
-
-    # Prefer shelves from the provided mapping (stable, already filtered/ordered by you)
-    for shelf_pos in item_positions_by_type.get(allocated_itemtype, []):
-        shelf = to_pos(shelf_pos)
-        if shelf not in adj:
-            continue
-
-        # Find the matching item object in state to get its id
-        for item in state.get("items", []):
-            if item.get("type") != allocated_itemtype:
-                continue
-            if to_pos(item.get("position")) == shelf:
-                return item.get("id")
-
-    return None
-
-# policies/greedy.py (put this ABOVE policy())
-
-def decide_action_one_bot(
-    state,
-    controller,
-    bot,
-    *,
-    blocked,
-    walls,
-    target_item=None,   # dict like {"id": "...", "type": "...", "position": [x,y]}
-    path=None,          # BFS path list [(x,y), (x,y), ...] toward your current goal (stand cell)
-    target_pos=None,    # optional fallback goal (x,y) if you don't pass path
-):
-    """
-    One-bot "action chooser" to keep policy() clean.
-
-    Priority:
-      1) DROP OFF if:
-         - bot carries >=1 item that the ACTIVE order still needs
-         - manhattan(bot_pos, dropoff) <= 1
-      2) PICK UP if:
-         - target_item is provided
-         - inventory has room
-         - manhattan(bot_pos, target_item.position) <= 1
-         - and ACTIVE order still needs that item type (if there is an active order)
-      3) Otherwise MOVE one step along `path` (if provided), else step toward `target_pos`.
-      4) Else WAIT.
-
-    Uses only the function args for obstacles (walls + blocked).
-    """
-
-    def manhattan(a, b):
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-    def bot_pos(b):
-        # prefer controller helper if it exists
-        if hasattr(controller, "_position"):
-            return controller._position(b)
-        p = b.get("position", b)
-        if isinstance(p, dict):
-            return (int(p.get("x", 0) or 0), int(p.get("y", 0) or 0))
-        return (int(p[0]), int(p[1]))
-
-    def as_pos(p):
-        q = _to_pos(p)
-        if q is None:
-            return (0, 0)
-        return q
-
-    def move_action(from_pos, to_pos):
-        dx = to_pos[0] - from_pos[0]
-        dy = to_pos[1] - from_pos[1]
-        if dx == 1 and dy == 0:
-            return "move_right"
-        if dx == -1 and dy == 0:
-            return "move_left"
-        if dx == 0 and dy == 1:
-            return "move_down"
-        if dx == 0 and dy == -1:
-            return "move_up"
-        return "wait"
-
-    bot_id = bot.get("id")
-    pos = bot_pos(bot)
-
-    obstacles = set(tuple(w) if isinstance(w, (list, tuple)) else w for w in walls) | set(
-        tuple(b) if isinstance(b, (list, tuple)) else b for b in blocked
-    )
-    obstacles.discard(pos)  # don't block yourself
-
-    inv = bot.get("inventory", []) or []
-    inv_types = []
-    for it in inv:
-        if isinstance(it, dict):
-            inv_types.append(it.get("type"))
-        else:
-            inv_types.append(it)  # sometimes stored as type string
-
-    # ---- find ACTIVE order + what it still needs ----
-    active_order = _select_active_order(state.get("orders", []) or [])
-    need = _remaining_need_counts(active_order)
-
-    def active_needs_type(t):
-        if not active_order:
-            return True  # if no active order found, don't block pickup/drop logic
-        return need.get(str(t), 0) > 0
-
-    # ---- 1) DROP OFF only when standing on dropoff and carrying needed item(s) ----
-    if active_order:
-        carries_needed = any(active_needs_type(t) for t in inv_types if t is not None)
-        if carries_needed and pos == controller.dropoff:
-            return {"bot": bot_id, "action": "drop_off"}
-
-    # ---- 2) PICK UP if near the target shelf and it is needed (and room) ----
-    if target_item and len(inv) < 3:
-        item_pos = target_item.get("position")
-        item_type = target_item.get("type")
-        if item_pos is not None and manhattan(pos, as_pos(item_pos)) <= 1:
-            if item_type is None or active_needs_type(item_type):
-                return {"bot": bot_id, "action": "pick_up", "item_id": target_item.get("id")}
-
-    # ---- 3) MOVE along path (preferred), else toward target_pos ----
-    if path and len(path) >= 2:
-        nxt = path[1]
-        if controller.in_bounds(nxt) and nxt not in obstacles and controller.is_free_static(nxt):
-            return {"bot": bot_id, "action": move_action(pos, nxt)}
-        return {"bot": bot_id, "action": "wait"}
-
-    if target_pos is not None:
-        tx, ty = target_pos
-        x, y = pos
-
-        # simple "try best axis then fallback"
-        candidates = []
-        if abs(tx - x) >= abs(ty - y):
-            candidates.append((x + (1 if tx > x else -1), y) if tx != x else None)
-            candidates.append((x, y + (1 if ty > y else -1)) if ty != y else None)
-        else:
-            candidates.append((x, y + (1 if ty > y else -1)) if ty != y else None)
-            candidates.append((x + (1 if tx > x else -1), y) if tx != x else None)
-
-        for c in candidates:
-            if c is None:
-                continue
-            if controller.in_bounds(c) and c not in obstacles and controller.is_free_static(c):
-                return {"bot": bot_id, "action": move_action(pos, c)}
-
-    return {"bot": bot_id, "action": "wait"}
 
 def policy(state: Dict[str, Any], controller) -> List[Action]:
-    # Basic validation
     if state.get("type") != "game_state":
         return []
 
     bots = state.get("bots", [])
     if not isinstance(bots, list) or not bots:
         return []
-
     bot = bots[0]
 
-    # Debug defaults consumed by client logging.
-    controller._debug_last_target = None
-    controller._debug_last_inventory_count = len(bot.get("inventory", []) or [])
-
-    # Static helpers from controller
     blocked = controller.blocked_positions(state)
-    item_positions_by_type = controller.build_item_positions_by_type(state)
-    walls = getattr(controller, "walls", set())
+    walls = set(getattr(controller, "walls", set()))
 
-    # Determine ACTIVE order and split items into active vs preview
     active_order = _select_active_order(state.get("orders", []) or [])
     need_counts = _remaining_need_counts(active_order)
 
-    def _as_list(x):
-        return list(x or [])
+    inv = bot.get("inventory", []) or []
+    inv_types = _inventory_types(inv)
 
-    active_items = []
-    preview_items = []
-    items = state.get("items", []) or []
+    if _to_pos(bot.get("position")) == controller.dropoff and any(need_counts.get(t, 0) > 0 for t in inv_types):
+        return [{"bot": bot.get("id"), "action": "drop_off"}]
 
-    if active_order is not None:
-        # Items required by the active order (and still missing) are "active".
-        inv_counter = Counter(
-            str(it.get("type")) for it in (bot.get("inventory", []) or []) if isinstance(it, dict) and it.get("type")
-        )
-        remaining_after_inv = Counter({
-            t: max(0, count - inv_counter.get(t, 0))
-            for t, count in need_counts.items()
-        })
-        active_quota = remaining_after_inv.copy()
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            item_type = str(it.get("type"))
-            if active_quota.get(item_type, 0) > 0:
-                active_items.append(it)
-                active_quota[item_type] -= 1
-            else:
-                preview_items.append(it)
-    else:
-        preview_items = [it for it in items if isinstance(it, dict)]
-
-    # Ask controller to allocate up to inventory capacity for this bot
-    try:
-        allocated_items = controller.allocate_items_for_bot(bot, active_items, preview_items)
-    except TypeError:
-        # Fallback if signature differs
-        allocated_items = controller.allocate_items_for_bot(bot, active_items, preview_items)
-
-    # Convert allocated_items to a list of types for the planner
-    item_types = [it.get("type") for it in (allocated_items or []) if isinstance(it, dict) and it.get("type")]
-
-    inv_now = bot.get("inventory", []) or []
-    if len(inv_now) >= 3:
+    if len(inv) >= 3 or (inv and not need_counts):
         drop_path = bfs_path(
             start=_to_pos(bot.get("position")) or (0, 0),
             goal=controller.dropoff,
@@ -480,65 +220,61 @@ def policy(state: Dict[str, Any], controller) -> List[Action]:
             walls=set(getattr(controller, "walls", set())),
             blocked=set(blocked),
         )
-        if drop_path:
+        if drop_path and len(drop_path) >= 2:
             controller._debug_last_target = controller.dropoff
-            return [
-                decide_action_one_bot(
-                    state,
-                    controller,
-                    bot,
-                    blocked=blocked,
-                    walls=walls,
-                    path=drop_path,
-                    target_pos=controller.dropoff,
-                )
-            ]
+            controller._debug_last_inventory_count = len(inv)
+            return [{"bot": bot.get("id"), "action": _move_action(drop_path[0], drop_path[1])}]
 
-    ordered_shelves, path_to_first = plan_item_run(
-        state=state,
-        controller=controller,
-        item_types=item_types,
-        walls=walls,
-        blocked=blocked,
-        bot=bot,
-    )
+    active_items = []
+    preview_items = []
+    for it in state.get("items", []) or []:
+        if not isinstance(it, dict):
+            continue
+        t = str(it.get("type"))
+        if need_counts.get(t, 0) > 0:
+            active_items.append(it)
+        else:
+            preview_items.append(it)
 
-    # Determine target_item aligned with the planned first shelf, so pickup can happen.
+    allocated = controller.allocate_items_for_bot(bot, active_items, preview_items)
+    wanted_types = [it.get("type") for it in allocated if isinstance(it, dict)]
+
+    # Never plan preview pickups while active needs still exist.
+    # This avoids deadlocking a full inventory with non-deliverable items.
+    if need_counts:
+        wanted_types = [t for t in wanted_types if need_counts.get(str(t), 0) > 0]
+    shelves, first_path = plan_item_run(state, controller, wanted_types, walls, blocked, bot)
+
     target_item = None
-    if ordered_shelves:
-        planned_shelf = _to_pos(ordered_shelves[0])
-        for it in items:
+    if shelves:
+        first_shelf = shelves[0]
+        for it in state.get("items", []):
+            if isinstance(it, dict) and _to_pos(it.get("position")) == first_shelf:
+                target_item = it
+                break
+
+    if target_item is None:
+        bot_pos = _to_pos(bot.get("position")) or (0, 0)
+        for it in active_items:
             if not isinstance(it, dict):
                 continue
             ip = _to_pos(it.get("position"))
-            if planned_shelf is not None and ip == planned_shelf:
+            if ip is not None and abs(bot_pos[0] - ip[0]) + abs(bot_pos[1] - ip[1]) == 1:
                 target_item = it
                 break
 
-    # Fallback: if no planned shelf (or item vanished), keep old behavior.
-    if target_item is None and allocated_items:
-        first_type = allocated_items[0].get("type")
-        for it in items:
-            if isinstance(it, dict) and it.get("type") == first_type:
-                target_item = it
-                break
-
-    # Debug fields consumed by client logging.
-    try:
-        inv = bot.get("inventory", []) or []
-        controller._debug_last_target = _to_pos(target_item.get("position")) if isinstance(target_item, dict) else None
+    pick_action = _pick_item_if_adjacent(bot, target_item, need_counts)
+    if pick_action:
+        controller._debug_last_target = _to_pos(target_item.get("position")) if target_item else None
         controller._debug_last_inventory_count = len(inv)
-    except Exception:
-        pass
+        return [pick_action]
 
-    action = decide_action_one_bot(
-        state,
-        controller,
-        bot,
-        blocked=blocked,
-        walls=walls,
-        target_item=target_item,
-        path=path_to_first,
-    )
+    if first_path and len(first_path) >= 2:
+        controller._debug_last_target = first_path[-1]
+        controller._debug_last_inventory_count = len(inv)
+        return [{"bot": bot.get("id"), "action": _move_action(first_path[0], first_path[1])}]
 
-    return [action]
+    controller._debug_last_target = None
+    controller._debug_last_inventory_count = len(inv)
+    logger.info("No feasible plan for round=%s; waiting", state.get("round"))
+    return [{"bot": bot.get("id"), "action": "wait"}]
