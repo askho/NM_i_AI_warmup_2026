@@ -24,3 +24,8 @@ debug_backed.py
 .vscode/
 .idea/
 .DS_Store
+
+# local artifacts
+__pycache__/
+*.pyc
+log*.txt
