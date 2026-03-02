@@ -124,6 +124,30 @@ def test_full_inventory_moves_toward_dropoff_instead_of_waiting():
     assert actions[0]["action"] in {"move_right", "move_down"}
 
 
+def test_string_inventory_drops_off_on_dropoff_cell_when_needed():
+    controller = BotController(policy)
+    state = {
+        "type": "game_state",
+        "round": 10,
+        "board": {"width": 6, "height": 6, "walls": []},
+        "drop_off": [1, 1],
+        "bots": [{"id": 0, "position": {"x": 1, "y": 1}, "inventory": ["milk", "bread"]}],
+        "items": [{"id": "i1", "type": "milk", "position": [2, 1]}],
+        "orders": [
+            {
+                "id": "order_5",
+                "status": "active",
+                "items_required": ["milk"],
+                "items_delivered": [],
+                "complete": False,
+            }
+        ],
+    }
+
+    actions = controller.act(state)
+    assert actions[0]["action"] == "drop_off"
+
+
 def test_policy_uses_latest_active_order_by_increasing_order_id():
     controller = BotController(policy)
     state = {
