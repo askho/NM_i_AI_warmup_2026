@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from collections import Counter, deque
-from dataclasses import dataclass
-from itertools import permutations, product
-from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from planning.assignments import ItemCandidate, assign_items_to_bots, choose_best_stand
 from planning.pathfinding import bfs_path, neighbors4
@@ -13,27 +12,24 @@ Action = Dict[str, Any]
 
 
 @dataclass
-class Target:
-    item_id: str
-    item_type: str
-    shelf_pos: Pos
-    stand_pos: Pos
-
-
-@dataclass
 class BotIntent:
-    mode: str = "IDLE"
-    targets: List[Target] = None
-    action_queue: Deque[Action] = None
-
-    def __post_init__(self) -> None:
-        if self.targets is None:
-            self.targets = []
-        if self.action_queue is None:
-            self.action_queue = deque()
+    mode: str = "IDLE"  # IDLE | PICK | DROPOFF
+    item_id: Optional[str] = None
+    item_type: Optional[str] = None
+    shelf_pos: Optional[Pos] = None
+    stand_pos: Optional[Pos] = None
+    path: List[Pos] = field(default_factory=list)
 
 
 class OptimizedMultiBotPolicy:
+    """Robust multi-bot policy focused on throughput and low-stall behavior.
+
+    Strategy per round:
+      1) Bots carrying active-order items prioritize dropoff.
+      2) Remaining bots get globally assigned nearest needed items.
+      3) Movement is planned with short BFS and one-step reservation to reduce clashes.
+    """
+
     def __init__(self, horizon: int = 8, replan_every: int = 1) -> None:
         self.horizon = horizon
         self.replan_every = max(1, replan_every)
@@ -45,10 +41,11 @@ class OptimizedMultiBotPolicy:
             return []
 
         bots = [b for b in state.get("bots", []) if isinstance(b, dict) and "id" in b]
-        active = _select_active_order(state.get("orders", []) or [])
-        need = _remaining_need(active)
         if not bots:
             return []
+
+        active = _select_active_order(state.get("orders", []) or [])
+        need = _remaining_need(active)
         if not need:
             return [{"bot": b["id"], "action": "wait"} for b in bots]
 
@@ -57,9 +54,9 @@ class OptimizedMultiBotPolicy:
             self._replan(state, controller, bots, need)
             self._last_replan_round = round_no
 
-        reservations = _build_reservations(self._intents, bots, controller, self.horizon)
-
         actions: List[Action] = []
+        reserved_next: Set[Pos] = set()
+
         for bot in bots:
             bot_id = str(bot["id"])
             bot_pos = _to_pos(bot.get("position")) or (0, 0)
@@ -70,49 +67,82 @@ class OptimizedMultiBotPolicy:
                 actions.append({"bot": bot["id"], "action": "drop_off"})
                 continue
 
-            pick = _pick_if_possible(bot, state.get("items", []) or [], intent.targets, need)
+            pick = _pick_if_possible(bot, state.get("items", []) or [], intent, need)
             if pick is not None:
                 actions.append(pick)
                 continue
 
-            next_pos = reservations.get(bot_id, {}).get(1)
-            if next_pos is None or next_pos == bot_pos:
+            goal = _intent_goal(intent, controller.dropoff)
+            blocked_now = {
+                _to_pos(other.get("position")) or (0, 0)
+                for other in bots
+                if str(other.get("id")) != bot_id
+            }
+            path = bfs_path(
+                bot_pos,
+                goal,
+                width=controller.width,
+                height=controller.height,
+                walls=set(controller.walls),
+                blocked=blocked_now,
+            )
+            step = path[1] if path and len(path) > 1 else bot_pos
+
+            if step == bot_pos or step in reserved_next:
                 actions.append({"bot": bot["id"], "action": "wait"})
+                reserved_next.add(bot_pos)
             else:
-                actions.append({"bot": bot["id"], "action": _move_action(bot_pos, next_pos)})
+                actions.append({"bot": bot["id"], "action": _move_action(bot_pos, step)})
+                reserved_next.add(step)
+
         return actions
 
     def _replan(self, state: Dict[str, Any], controller, bots: List[dict], need: Counter) -> None:
-        candidates = _build_candidates(state.get("items", []) or [], need, controller)
+        items = state.get("items", []) or []
+
+        carry_need = _carry_contribution_to_active_need(need, bots)
+        pick_need = need - carry_need
+        pick_need = Counter({k: v for k, v in pick_need.items() if v > 0})
+
+        candidates = _build_candidates(items, pick_need, controller)
 
         def cost(bot: dict, cand: ItemCandidate) -> int:
             bot_pos = _to_pos(bot.get("position")) or (0, 0)
             stand = choose_best_stand(bot_pos, cand, lambda a, b: _distance(controller, a, b))
-            return 10**6 if stand is None else (_distance(controller, bot_pos, stand) or 10**6)
+            if stand is None:
+                return 10**6
+            dist = _distance(controller, bot_pos, stand)
+            return 10**6 if dist is None else dist
 
-        assigned = assign_items_to_bots(bots, candidates, need, cost)
+        assigned = assign_items_to_bots(bots, candidates, pick_need, cost)
 
         for bot in bots:
             bot_id = str(bot["id"])
             bot_pos = _to_pos(bot.get("position")) or (0, 0)
-            inv = bot.get("inventory", []) or []
-            intent = self._intents.setdefault(bot_id, BotIntent())
+            inv = [str(x) for x in (bot.get("inventory", []) or [])]
 
-            if len(inv) >= 3:
-                intent.mode = "DROPOFF"
-                intent.targets = []
+            if any(need.get(t, 0) > 0 for t in inv) or len(inv) >= 3:
+                self._intents[bot_id] = BotIntent(mode="DROPOFF")
                 continue
 
-            items = assigned.get(bot_id, [])
-            if not items:
-                intent.mode = "IDLE"
-                intent.targets = []
+            my_items = assigned.get(bot_id, [])
+            if not my_items:
+                self._intents[bot_id] = BotIntent(mode="IDLE")
                 continue
 
-            trip = _best_bot_trip(bot_pos, items, controller)
-            targets = [Target(c.item_id, c.item_type, c.shelf_pos, stand) for c, stand in trip]
-            intent.mode = "PICK"
-            intent.targets = targets
+            chosen = my_items[0]
+            stand = choose_best_stand(bot_pos, chosen, lambda a, b: _distance(controller, a, b))
+            if stand is None:
+                self._intents[bot_id] = BotIntent(mode="IDLE")
+                continue
+
+            self._intents[bot_id] = BotIntent(
+                mode="PICK",
+                item_id=chosen.item_id,
+                item_type=chosen.item_type,
+                shelf_pos=chosen.shelf_pos,
+                stand_pos=stand,
+            )
 
 
 def _build_candidates(items: Sequence[dict], need: Counter, controller) -> List[ItemCandidate]:
@@ -133,120 +163,43 @@ def _build_candidates(items: Sequence[dict], need: Counter, controller) -> List[
     return out
 
 
-def _best_bot_trip(bot_pos: Pos, assigned_items: List[ItemCandidate], controller) -> List[Tuple[ItemCandidate, Pos]]:
-    best: Optional[Tuple[int, List[Tuple[ItemCandidate, Pos]]]] = None
-    max_items = min(2, len(assigned_items))
-    shortlist = assigned_items[:max_items]
-    for perm in permutations(shortlist, len(shortlist)):
-        for stands in product(*[cand.stands for cand in perm]):
-            total = 0
-            cur = bot_pos
-            valid = True
-            for stand in stands:
-                d = _distance(controller, cur, stand)
-                if d is None:
-                    valid = False
-                    break
-                total += d + 1
-                cur = stand
-            d_drop = _distance(controller, cur, controller.dropoff)
-            if d_drop is None:
-                valid = False
-            else:
-                total += d_drop + 1
-            if not valid:
-                continue
-            plan = list(zip(perm, stands))
-            if best is None or total < best[0]:
-                best = (total, plan)
-    return best[1] if best is not None else []
-
-
-def _build_reservations(intents: Dict[str, BotIntent], bots: List[dict], controller, horizon: int) -> Dict[str, Dict[int, Pos]]:
-    reservations: Dict[int, set[Pos]] = {t: set() for t in range(horizon + 1)}
-    edge_res: Dict[int, set[Tuple[Pos, Pos]]] = {t: set() for t in range(1, horizon + 1)}
-    out: Dict[str, Dict[int, Pos]] = {}
-
-    priorities = sorted(
-        bots,
-        key=lambda b: (
-            -len(b.get("inventory", []) or []),
-            str(b.get("id")),
-        ),
-    )
-
-    for bot in priorities:
-        bot_id = str(bot["id"])
-        pos = _to_pos(bot.get("position")) or (0, 0)
-        intent = intents.get(bot_id, BotIntent())
-        if intent.mode == "DROPOFF" or not intent.targets:
-            goal = controller.dropoff
-        else:
-            goal = intent.targets[0].stand_pos
-
-        path = _time_bfs(pos, goal, controller, reservations, edge_res, horizon)
-        schedule: Dict[int, Pos] = {}
-        for t, cell in enumerate(path[: horizon + 1]):
-            schedule[t] = cell
-            reservations[t].add(cell)
-            if t > 0:
-                edge_res[t].add((path[t - 1], cell))
-        out[bot_id] = schedule
-    return out
-
-
-def _time_bfs(start: Pos, goal: Pos, controller, reservations, edge_res, horizon: int) -> List[Pos]:
-    q = deque([(start, 0)])
-    parent: Dict[Tuple[Pos, int], Tuple[Pos, int]] = {}
-    seen = {(start, 0)}
-
-    while q:
-        pos, t = q.popleft()
-        if pos == goal:
-            return _reconstruct_time_path((pos, t), parent)
-        if t >= horizon:
+def _carry_contribution_to_active_need(need: Counter, bots: Sequence[dict]) -> Counter:
+    carried = Counter()
+    remaining = Counter(need)
+    for bot in bots:
+        if not isinstance(bot, dict):
             continue
-        for nxt in [pos, *neighbors4(pos)]:
-            nt = t + 1
-            if nxt != pos and not controller.is_free_static(nxt):
-                continue
-            if nxt in reservations.get(nt, set()):
-                continue
-            if (nxt, pos) in edge_res.get(nt, set()):
-                continue
-            node = (nxt, nt)
-            if node in seen:
-                continue
-            seen.add(node)
-            parent[node] = (pos, t)
-            q.append(node)
-    return [start]
+        for inv_item in (bot.get("inventory", []) or []):
+            t = str(inv_item)
+            if remaining.get(t, 0) > 0:
+                remaining[t] -= 1
+                carried[t] += 1
+    return carried
 
 
-def _reconstruct_time_path(node: Tuple[Pos, int], parent: Dict[Tuple[Pos, int], Tuple[Pos, int]]) -> List[Pos]:
-    path = [node[0]]
-    while node in parent:
-        node = parent[node]
-        path.append(node[0])
-    path.reverse()
-    return path
-
-
-def _pick_if_possible(bot: dict, items: Sequence[dict], targets: Sequence[Target], need: Counter) -> Optional[Action]:
-    if not targets:
+def _pick_if_possible(bot: dict, items: Sequence[dict], intent: BotIntent, need: Counter) -> Optional[Action]:
+    if intent.mode != "PICK" or not intent.item_id or not intent.item_type:
         return None
     bot_pos = _to_pos(bot.get("position")) or (0, 0)
     inv = bot.get("inventory", []) or []
     if len(inv) >= 3:
         return None
-    target = targets[0]
+
     for item in items:
-        if item.get("id") != target.item_id:
+        if item.get("id") != intent.item_id:
             continue
         shelf = _to_pos(item.get("position"))
-        if shelf and abs(bot_pos[0] - shelf[0]) + abs(bot_pos[1] - shelf[1]) == 1 and need.get(target.item_type, 0) > 0:
-            return {"bot": bot.get("id"), "action": "pick_up", "item_id": target.item_id}
+        if shelf and abs(bot_pos[0] - shelf[0]) + abs(bot_pos[1] - shelf[1]) == 1 and need.get(intent.item_type, 0) > 0:
+            return {"bot": bot.get("id"), "action": "pick_up", "item_id": intent.item_id}
     return None
+
+
+def _intent_goal(intent: BotIntent, dropoff: Pos) -> Pos:
+    if intent.mode == "DROPOFF":
+        return dropoff
+    if intent.mode == "PICK" and intent.stand_pos is not None:
+        return intent.stand_pos
+    return dropoff
 
 
 def _distance(controller, start: Pos, goal: Pos) -> Optional[int]:
