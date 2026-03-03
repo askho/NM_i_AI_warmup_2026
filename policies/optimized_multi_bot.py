@@ -301,14 +301,43 @@ def _move_action(a: Pos, b: Pos) -> str:
 
 
 def _select_active_order(orders: Sequence[dict]) -> Optional[dict]:
-    active = [o for o in orders if isinstance(o, dict) and o.get("status") == "active"]
-    return active[0] if active else None
+    normalized = [o for o in orders if isinstance(o, dict)]
+    if not normalized:
+        return None
+
+    explicit_active = [o for o in normalized if str(o.get("status", "")).lower() == "active"]
+    if explicit_active:
+        return explicit_active[0]
+
+    incomplete = [o for o in normalized if not bool(o.get("complete", False))]
+    if incomplete:
+        return incomplete[0]
+
+    return normalized[0]
+
+
+def _as_item_counter(value: Any) -> Counter:
+    if isinstance(value, Counter):
+        return Counter({str(k): int(v) for k, v in value.items() if int(v) > 0})
+    if isinstance(value, dict):
+        out: Counter = Counter()
+        for k, v in value.items():
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                continue
+            if iv > 0:
+                out[str(k)] = iv
+        return out
+    if isinstance(value, list):
+        return Counter(str(x) for x in value)
+    return Counter()
 
 
 def _remaining_need(order: Optional[dict]) -> Counter:
     if not order:
         return Counter()
-    req = Counter(str(x) for x in (order.get("items_required") or order.get("items") or []))
-    delivered = Counter(str(x) for x in (order.get("items_delivered") or []))
+    req = _as_item_counter(order.get("items_required") or order.get("required_items") or order.get("items") or [])
+    delivered = _as_item_counter(order.get("items_delivered") or order.get("delivered_items") or order.get("delivered") or [])
     rem = req - delivered
     return Counter({k: v for k, v in rem.items() if v > 0})

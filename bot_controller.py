@@ -101,28 +101,66 @@ class BotController:
                 if key in self.bots_by_id and key not in by_bot:
                     by_bot[key] = a
 
-        sanitized: List[Action] = []
-        occupied_destinations: set[Pos] = set()
-
+        proposed: List[Tuple[Dict[str, Any], Action, Pos, Pos]] = []
         for bot in self.bots:
             if not isinstance(bot, dict):
                 continue
+            bot_id_raw = bot.get("id")
+            bot_key = str(bot_id_raw)
+            candidate = by_bot.get(bot_key)
+            action = self._sanitize_for_bot(candidate, bot, bot_id_raw)
+            start = self._position(bot)
+            destination = self._destination(bot, action)
+            proposed.append((bot, action, start, destination))
 
+        # Deterministic priority: bots with more inventory first, then id.
+        order = sorted(
+            range(len(proposed)),
+            key=lambda i: (-len(proposed[i][0].get("inventory", []) or []), str(proposed[i][0].get("id"))),
+        )
+
+        starts = {str(bot.get("id")): start for bot, _action, start, _dest in proposed}
+        destinations = {str(bot.get("id")): dest for bot, _action, _start, dest in proposed}
+
+        accepted: Dict[str, Action] = {}
+        occupied_destinations: set[Pos] = set()
+
+        for i in order:
+            bot, action, start, destination = proposed[i]
             bot_id_raw = bot.get("id")
             bot_key = str(bot_id_raw)
 
-            candidate = by_bot.get(bot_key)
-            action = self._sanitize_for_bot(candidate, bot, bot_id_raw)
+            if action["action"] in _MOVE_DELTAS:
+                # Block moves into currently occupied cells unless occupant is moving away.
+                occupant = next((other_key for other_key, other_start in starts.items() if other_start == destination), None)
+                if occupant is not None and destinations.get(occupant) == destination:
+                    action = {"bot": bot_id_raw, "action": "wait"}
+                    destination = start
 
-            destination = self._destination(bot, action)
+                # Block head-on swaps (A->B.start and B->A.start)
+                for other_key, other_start in starts.items():
+                    if other_key == bot_key:
+                        continue
+                    if destination == other_start and destinations.get(other_key) == start:
+                        # Lower-priority bot yields.
+                        if other_key in accepted:
+                            action = {"bot": bot_id_raw, "action": "wait"}
+                            destination = start
+                        break
 
-            # Same-destination conflict resolution
-            if destination in occupied_destinations and action["action"] != "wait":
-                action = {"bot": bot_id_raw, "action": "wait"}
-                destination = self._destination(bot, action)
+                if destination in occupied_destinations:
+                    action = {"bot": bot_id_raw, "action": "wait"}
+                    destination = start
 
             occupied_destinations.add(destination)
-            sanitized.append(action)
+            accepted[bot_key] = action
+
+        sanitized: List[Action] = []
+        for bot in self.bots:
+            if not isinstance(bot, dict):
+                continue
+            bot_key = str(bot.get("id"))
+            sanitized.append(accepted.get(bot_key, {"bot": bot.get("id"), "action": "wait"}))
 
         return sanitized
 

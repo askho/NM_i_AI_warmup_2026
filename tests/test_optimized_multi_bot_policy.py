@@ -7,6 +7,8 @@ from policies.optimized_multi_bot import (
     Target,
     _build_reservations,
     _remaining_pick_need,
+    _remaining_need,
+    _select_active_order,
 )
 
 
@@ -121,3 +123,21 @@ def test_policy_prioritizes_dropoff_when_carrying_deliverable_item():
     controller = DummyController()
     actions = policy(state, controller)
     assert actions[0]["action"] in {"move_left", "move_up"}
+
+
+def test_select_active_order_falls_back_to_incomplete_when_status_missing():
+    orders = [
+        {"id": "o1", "complete": True, "items_required": ["apple"], "items_delivered": ["apple"]},
+        {"id": "o2", "complete": False, "items_required": ["banana"], "items_delivered": []},
+    ]
+    active = _select_active_order(orders)
+    assert active is not None
+    assert active["id"] == "o2"
+
+
+def test_remaining_need_supports_dict_payloads():
+    order = {
+        "items_required": {"apple": 2, "banana": 1},
+        "items_delivered": {"apple": 1},
+    }
+    assert _remaining_need(order) == Counter({"apple": 1, "banana": 1})
