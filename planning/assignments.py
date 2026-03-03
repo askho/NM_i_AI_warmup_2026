@@ -29,10 +29,10 @@ def assign_items_to_bots(
     max_inventory: int = 3,
     max_slots_per_bot: int = 2,
 ) -> Dict[str, List[ItemCandidate]]:
-    """Greedy min-cost matching over (bot slots, item candidates).
+    """Balanced min-cost assignment over bot pickup slots.
 
-    This is an ILP-lite approximation that avoids heavy dependencies while still
-    producing globally consistent, collision-aware assignments.
+    Uses a multi-wave assignment pass so medium/hard maps don't over-concentrate
+    work on a single nearest bot while others idle.
     """
     bot_list = [b for b in bots if isinstance(b, dict) and "id" in b]
     cand_list = [c for c in candidates if need.get(c.item_type, 0) > 0]
@@ -42,36 +42,48 @@ def assign_items_to_bots(
         return assigned
 
     available_by_type = Counter(need)
-
-    slot_rows: List[Tuple[str, int, dict]] = []
-    for bot in bot_list:
-        free = max(0, max_inventory - _inventory_size(bot))
-        for slot_idx in range(min(max_slots_per_bot, free)):
-            slot_rows.append((str(bot["id"]), slot_idx, bot))
-
-    scored_edges: List[Tuple[int, str, str, ItemCandidate]] = []
-    for bot_id, _slot, bot in slot_rows:
-        for cand in cand_list:
-            score = distance_cost(bot, cand)
-            scored_edges.append((score, bot_id, cand.item_id, cand))
-
-    scored_edges.sort(key=lambda x: (x[0], x[1], x[2]))
-
     used_items: set[str] = set()
-    used_slots: Counter = Counter()
-    slot_caps = Counter(slot_bot_id for slot_bot_id, _slot, _bot in slot_rows)
 
-    for _score, bot_id, item_id, cand in scored_edges:
-        if item_id in used_items:
-            continue
-        if used_slots[bot_id] >= slot_caps[bot_id]:
-            continue
-        if available_by_type[cand.item_type] <= 0:
-            continue
-        assigned[bot_id].append(cand)
-        used_items.add(item_id)
-        used_slots[bot_id] += 1
-        available_by_type[cand.item_type] -= 1
+    slot_caps: Dict[str, int] = {}
+    for bot in bot_list:
+        bot_id = str(bot["id"])
+        free = max(0, max_inventory - _inventory_size(bot))
+        slot_caps[bot_id] = min(max_slots_per_bot, free)
+
+    # Pre-score edges once and reuse in each wave.
+    edge_cost: Dict[tuple[str, str], int] = {}
+    for bot in bot_list:
+        bot_id = str(bot["id"])
+        for cand in cand_list:
+            edge_cost[(bot_id, cand.item_id)] = distance_cost(bot, cand)
+
+    # Wave 1: each bot gets at most one item before anyone gets a second.
+    max_waves = max(slot_caps.values(), default=0)
+    for wave in range(max_waves):
+        for bot in bot_list:
+            bot_id = str(bot["id"])
+            if len(assigned[bot_id]) > wave:
+                continue
+            if len(assigned[bot_id]) >= slot_caps.get(bot_id, 0):
+                continue
+
+            best: Optional[Tuple[int, ItemCandidate]] = None
+            for cand in cand_list:
+                if cand.item_id in used_items:
+                    continue
+                if available_by_type[cand.item_type] <= 0:
+                    continue
+                score = edge_cost.get((bot_id, cand.item_id), 10**6)
+                if best is None or score < best[0] or (score == best[0] and cand.item_id < best[1].item_id):
+                    best = (score, cand)
+
+            if best is None:
+                continue
+
+            chosen = best[1]
+            assigned[bot_id].append(chosen)
+            used_items.add(chosen.item_id)
+            available_by_type[chosen.item_type] -= 1
 
     return assigned
 

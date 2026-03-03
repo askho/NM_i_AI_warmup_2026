@@ -43,6 +43,7 @@ class BotController:
         self.max_rounds: int = 0
         self.bots: List[Dict[str, Any]] = []
         self.bots_by_id: Dict[str, Dict[str, Any]] = {}
+        self.items: List[Dict[str, Any]] = []
 
     def set_policy(self, policy: Policy) -> None:
         self._policy = policy
@@ -75,6 +76,9 @@ class BotController:
             bot_id_raw = bot.get("id")
             self.bots_by_id[str(bot_id_raw)] = bot
 
+        raw_items = state.get("items", [])
+        self.items = raw_items if isinstance(raw_items, list) else []
+
     # ------------
     # Main entry
     # ------------
@@ -101,27 +105,39 @@ class BotController:
                 if key in self.bots_by_id and key not in by_bot:
                     by_bot[key] = a
 
-        sanitized: List[Action] = []
-        occupied_destinations: set[Pos] = set()
-
+        planned: List[tuple[Dict[str, Any], Any, Action]] = []
         for bot in self.bots:
             if not isinstance(bot, dict):
                 continue
-
             bot_id_raw = bot.get("id")
             bot_key = str(bot_id_raw)
-
             candidate = by_bot.get(bot_key)
             action = self._sanitize_for_bot(candidate, bot, bot_id_raw)
+            planned.append((bot, bot_id_raw, action))
 
+        # Resolve conflicts deterministically: duplicate destinations and head-on swaps.
+        sanitized: List[Action] = []
+        occupied_destinations: set[Pos] = set()
+        current_positions: Dict[Any, Pos] = {bid: self._position(bot) for bot, bid, _ in planned}
+        chosen_destinations: Dict[Any, Pos] = {}
+
+        for bot, bot_id_raw, action in planned:
             destination = self._destination(bot, action)
 
-            # Same-destination conflict resolution
             if destination in occupied_destinations and action["action"] != "wait":
                 action = {"bot": bot_id_raw, "action": "wait"}
                 destination = self._destination(bot, action)
 
+            # Avoid head-on swaps where two bots exchange cells in one tick.
+            if action["action"] != "wait":
+                for other_id, other_dest in chosen_destinations.items():
+                    if other_dest == current_positions.get(bot_id_raw) and destination == current_positions.get(other_id):
+                        action = {"bot": bot_id_raw, "action": "wait"}
+                        destination = self._destination(bot, action)
+                        break
+
             occupied_destinations.add(destination)
+            chosen_destinations[bot_id_raw] = destination
             sanitized.append(action)
 
         return sanitized
@@ -142,9 +158,20 @@ class BotController:
             item_id = action.get("item_id")
             if not isinstance(item_id, str):
                 return {"bot": bot_id_raw, "action": "wait"}
+            if len(bot.get("inventory", []) or []) >= 3:
+                return {"bot": bot_id_raw, "action": "wait"}
+            bot_pos = self._position(bot)
+            item = next((it for it in self.items if isinstance(it, dict) and it.get("id") == item_id), None)
+            item_pos = self._coerce_pos(item.get("position")) if isinstance(item, dict) else None
+            if item_pos is None:
+                return {"bot": bot_id_raw, "action": "wait"}
+            if abs(bot_pos[0] - item_pos[0]) + abs(bot_pos[1] - item_pos[1]) != 1:
+                return {"bot": bot_id_raw, "action": "wait"}
             return {"bot": bot_id_raw, "action": "pick_up", "item_id": item_id}
 
         if action_name == "drop_off":
+            if self._position(bot) != self.dropoff:
+                return {"bot": bot_id_raw, "action": "wait"}
             return {"bot": bot_id_raw, "action": "drop_off"}
 
         if action_name in _MOVE_DELTAS:

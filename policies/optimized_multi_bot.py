@@ -6,6 +6,7 @@ from itertools import permutations, product
 from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from planning.assignments import ItemCandidate, assign_items_to_bots, choose_best_stand
+from policies.greedy import policy as greedy_policy
 from planning.pathfinding import bfs_path, neighbors4
 
 Pos = Tuple[int, int]
@@ -39,6 +40,7 @@ class OptimizedMultiBotPolicy:
         self.replan_every = max(1, replan_every)
         self._last_replan_round = -1
         self._intents: Dict[str, BotIntent] = {}
+        self._stalled_rounds = 0
 
     def __call__(self, state: Dict[str, Any], controller) -> List[Action]:
         if state.get("type") != "game_state":
@@ -80,25 +82,40 @@ class OptimizedMultiBotPolicy:
                 actions.append({"bot": bot["id"], "action": "wait"})
             else:
                 actions.append({"bot": bot["id"], "action": _move_action(bot_pos, next_pos)})
+        if need and actions and all(a.get("action") == "wait" for a in actions):
+            self._stalled_rounds += 1
+        else:
+            self._stalled_rounds = 0
+
+        if self._stalled_rounds >= 2:
+            fallback_actions = greedy_policy(state, controller)
+            if fallback_actions:
+                self._stalled_rounds = 0
+                return fallback_actions
+
         return actions
 
     def _replan(self, state: Dict[str, Any], controller, bots: List[dict], need: Counter) -> None:
-        candidates = _build_candidates(state.get("items", []) or [], need, controller)
+        pick_need = _remaining_pick_need(need, bots)
+        candidates = _build_candidates(state.get("items", []) or [], pick_need, controller)
 
         def cost(bot: dict, cand: ItemCandidate) -> int:
             bot_pos = _to_pos(bot.get("position")) or (0, 0)
             stand = choose_best_stand(bot_pos, cand, lambda a, b: _distance(controller, a, b))
-            return 10**6 if stand is None else (_distance(controller, bot_pos, stand) or 10**6)
+            if stand is None:
+                return 10**6
+            dist = _distance(controller, bot_pos, stand)
+            return 10**6 if dist is None else dist
 
-        assigned = assign_items_to_bots(bots, candidates, need, cost)
+        assigned = assign_items_to_bots(bots, candidates, pick_need, cost)
 
         for bot in bots:
             bot_id = str(bot["id"])
             bot_pos = _to_pos(bot.get("position")) or (0, 0)
-            inv = bot.get("inventory", []) or []
+            inv = [str(x) for x in (bot.get("inventory", []) or [])]
             intent = self._intents.setdefault(bot_id, BotIntent())
 
-            if len(inv) >= 3:
+            if any(need.get(t, 0) > 0 for t in inv) or len(inv) >= 3:
                 intent.mode = "DROPOFF"
                 intent.targets = []
                 continue
@@ -114,6 +131,20 @@ class OptimizedMultiBotPolicy:
             intent.mode = "PICK"
             intent.targets = targets
 
+
+
+def _remaining_pick_need(need: Counter, bots: Sequence[dict]) -> Counter:
+    remaining = Counter(need)
+    for bot in bots:
+        if not isinstance(bot, dict):
+            continue
+        for item_type in (bot.get("inventory", []) or []):
+            key = str(item_type)
+            if remaining.get(key, 0) > 0:
+                remaining[key] -= 1
+                if remaining[key] <= 0:
+                    del remaining[key]
+    return remaining
 
 def _build_candidates(items: Sequence[dict], need: Counter, controller) -> List[ItemCandidate]:
     out: List[ItemCandidate] = []
@@ -191,6 +222,13 @@ def _build_reservations(intents: Dict[str, BotIntent], bots: List[dict], control
             reservations[t].add(cell)
             if t > 0:
                 edge_res[t].add((path[t - 1], cell))
+        if path:
+            final = path[min(len(path), horizon + 1) - 1]
+            start_t = min(len(path), horizon + 1)
+            for t in range(start_t, horizon + 1):
+                schedule[t] = final
+                reservations[t].add(final)
+                edge_res[t].add((final, final))
         out[bot_id] = schedule
     return out
 
