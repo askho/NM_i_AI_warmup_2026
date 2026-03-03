@@ -88,7 +88,10 @@ class OptimizedMultiBotPolicy:
         def cost(bot: dict, cand: ItemCandidate) -> int:
             bot_pos = _to_pos(bot.get("position")) or (0, 0)
             stand = choose_best_stand(bot_pos, cand, lambda a, b: _distance(controller, a, b))
-            return 10**6 if stand is None else (_distance(controller, bot_pos, stand) or 10**6)
+            if stand is None:
+                return 10**6
+            dist = _distance(controller, bot_pos, stand)
+            return 10**6 if dist is None else dist
 
         assigned = assign_items_to_bots(bots, candidates, need, cost)
 
@@ -191,6 +194,13 @@ def _build_reservations(intents: Dict[str, BotIntent], bots: List[dict], control
             reservations[t].add(cell)
             if t > 0:
                 edge_res[t].add((path[t - 1], cell))
+        if path:
+            final = path[min(len(path), horizon + 1) - 1]
+            start_t = min(len(path), horizon + 1)
+            for t in range(start_t, horizon + 1):
+                schedule[t] = final
+                reservations[t].add(final)
+                edge_res[t].add((final, final))
         out[bot_id] = schedule
     return out
 
