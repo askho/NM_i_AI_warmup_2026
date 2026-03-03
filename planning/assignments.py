@@ -49,20 +49,22 @@ def assign_items_to_bots(
         for slot_idx in range(min(max_slots_per_bot, free)):
             slot_rows.append((str(bot["id"]), slot_idx, bot))
 
-    scored_edges: List[Tuple[int, str, str, ItemCandidate]] = []
-    for bot_id, _slot, bot in slot_rows:
+    scored_edges: List[Tuple[int, int, str, str, ItemCandidate]] = []
+    for bot_id, slot_idx, bot in slot_rows:
         for cand in cand_list:
             score = distance_cost(bot, cand)
-            scored_edges.append((score, bot_id, cand.item_id, cand))
+            scored_edges.append((slot_idx, score, bot_id, cand.item_id, cand))
 
-    scored_edges.sort(key=lambda x: (x[0], x[1], x[2]))
+    scored_edges.sort(key=lambda x: (x[0], x[1], x[2], x[3]))
 
     used_items: set[str] = set()
     used_slots: Counter = Counter()
     slot_caps = Counter(slot_bot_id for slot_bot_id, _slot, _bot in slot_rows)
 
-    for _score, bot_id, item_id, cand in scored_edges:
+    for slot_idx, _score, bot_id, item_id, cand in scored_edges:
         if item_id in used_items:
+            continue
+        if used_slots[bot_id] != slot_idx:
             continue
         if used_slots[bot_id] >= slot_caps[bot_id]:
             continue
