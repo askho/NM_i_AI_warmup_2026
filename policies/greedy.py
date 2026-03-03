@@ -325,3 +325,6 @@ def _choose_nearest_item_to_pick(
 
     _, item_id, item_pos, approach_pos, item_type = best
     return (item_id, item_pos, approach_pos, item_type)
+
+# Backward-compatible export used by tests
+from policies.BFS_one_bot import plan_item_run  # noqa: E402

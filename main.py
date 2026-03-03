@@ -4,7 +4,7 @@ import logging
 from bot_controller import BotController
 from client import get_ws_url, play
 from logging_utils import configure_logging
-from policies.BFS_one_bot import policy as BFSOneBotPolicy
+from policies.optimized_multi_bot import OptimizedMultiBotPolicy
 from policy_selector import ConstantPolicySelector
 
 logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ def main() -> None:
         logger.error("No policy defined for difficulty '%s'", difficulty)
         raise SystemExit(1)
 
-    policy_instance = BFSOneBotPolicy
+    policy_instance = OptimizedMultiBotPolicy(horizon=8, replan_every=1)
     selector = ConstantPolicySelector(policy_instance)
     controller = BotController(policy=policy_instance)
 
