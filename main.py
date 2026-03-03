@@ -1,10 +1,11 @@
 import asyncio
 import logging
+import os
 
 from bot_controller import BotController
 from client import get_ws_url, play
 from logging_utils import configure_logging
-from policies.optimized_multi_bot import OptimizedMultiBotPolicy
+from policy_factory import select_policy_for_difficulty
 from policy_selector import ConstantPolicySelector
 
 logger = logging.getLogger(__name__)
@@ -13,12 +14,12 @@ logger = logging.getLogger(__name__)
 def main() -> None:
     configure_logging()
 
-    difficulty = "easy"
-    if difficulty != "easy":
-        logger.error("No policy defined for difficulty '%s'", difficulty)
+    difficulty = os.getenv("DIFFICULTY", "easy").strip().lower()
+    if difficulty not in {"easy", "medium", "hard", "expert"}:
+        logger.error("Unknown difficulty '%s'", difficulty)
         raise SystemExit(1)
 
-    policy_instance = OptimizedMultiBotPolicy(horizon=8, replan_every=1)
+    policy_instance = select_policy_for_difficulty(difficulty)
     selector = ConstantPolicySelector(policy_instance)
     controller = BotController(policy=policy_instance)
 

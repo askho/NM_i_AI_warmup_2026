@@ -54,7 +54,8 @@ class OptimizedMultiBotPolicy:
 
         round_no = int(state.get("round", 0) or 0)
         if round_no - self._last_replan_round >= self.replan_every:
-            self._replan(state, controller, bots, need)
+            need_for_assignment = _need_after_inventory(need, bots)
+            self._replan(state, controller, bots, need_for_assignment)
             self._last_replan_round = round_no
 
         reservations = _build_reservations(self._intents, bots, controller, self.horizon)
@@ -88,9 +89,37 @@ class OptimizedMultiBotPolicy:
         def cost(bot: dict, cand: ItemCandidate) -> int:
             bot_pos = _to_pos(bot.get("position")) or (0, 0)
             stand = choose_best_stand(bot_pos, cand, lambda a, b: _distance(controller, a, b))
-            return 10**6 if stand is None else (_distance(controller, bot_pos, stand) or 10**6)
+            if stand is None:
+                return 10**6
+            dist = _distance(controller, bot_pos, stand)
+            return 10**6 if dist is None else dist
 
-        assigned = assign_items_to_bots(bots, candidates, need, cost)
+        assigned = assign_items_to_bots(bots, candidates, need, cost, max_slots_per_bot=1)
+
+        assigned_item_ids = {cand.item_id for picks in assigned.values() for cand in picks}
+        remaining_need = Counter(need)
+        for picks in assigned.values():
+            for cand in picks:
+                if remaining_need.get(cand.item_type, 0) > 0:
+                    remaining_need[cand.item_type] -= 1
+        remaining_need = Counter({k: v for k, v in remaining_need.items() if v > 0})
+
+        if remaining_need:
+            remaining_candidates = [c for c in candidates if c.item_id not in assigned_item_ids]
+            bots_for_extra: List[dict] = []
+            for bot in bots:
+                bot_id = str(bot["id"])
+                taken = len(assigned.get(bot_id, []))
+                if taken >= 2:
+                    continue
+                bot_copy = dict(bot)
+                inv = list(bot.get("inventory", []) or [])
+                bot_copy["inventory"] = inv + ["__reserved__"] * taken
+                bots_for_extra.append(bot_copy)
+            extra = assign_items_to_bots(bots_for_extra, remaining_candidates, remaining_need, cost, max_slots_per_bot=2)
+            for bot_id, picks in extra.items():
+                if picks:
+                    assigned.setdefault(bot_id, []).extend(picks)
 
         for bot in bots:
             bot_id = str(bot["id"])
@@ -113,6 +142,19 @@ class OptimizedMultiBotPolicy:
             targets = [Target(c.item_id, c.item_type, c.shelf_pos, stand) for c, stand in trip]
             intent.mode = "PICK"
             intent.targets = targets
+
+
+def _need_after_inventory(need: Counter, bots: Sequence[dict]) -> Counter:
+    """Subtract items already carried by bots from assignment demand."""
+    outstanding = Counter(need)
+    for bot in bots:
+        if not isinstance(bot, dict):
+            continue
+        for item_type in (bot.get("inventory", []) or []):
+            t = str(item_type)
+            if outstanding.get(t, 0) > 0:
+                outstanding[t] -= 1
+    return Counter({k: v for k, v in outstanding.items() if v > 0})
 
 
 def _build_candidates(items: Sequence[dict], need: Counter, controller) -> List[ItemCandidate]:
@@ -191,6 +233,13 @@ def _build_reservations(intents: Dict[str, BotIntent], bots: List[dict], control
             reservations[t].add(cell)
             if t > 0:
                 edge_res[t].add((path[t - 1], cell))
+        if path:
+            final = path[min(len(path), horizon + 1) - 1]
+            start_t = min(len(path), horizon + 1)
+            for t in range(start_t, horizon + 1):
+                schedule[t] = final
+                reservations[t].add(final)
+                edge_res[t].add((final, final))
         out[bot_id] = schedule
     return out
 
