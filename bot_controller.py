@@ -101,30 +101,58 @@ class BotController:
                 if key in self.bots_by_id and key not in by_bot:
                     by_bot[key] = a
 
-        sanitized: List[Action] = []
-        occupied_destinations: set[Pos] = set()
+        bots_in_order = [b for b in self.bots if isinstance(b, dict)]
 
-        for bot in self.bots:
-            if not isinstance(bot, dict):
-                continue
-
+        sanitized_by_bot: Dict[str, Action] = {}
+        current_pos: Dict[str, Pos] = {}
+        for bot in bots_in_order:
             bot_id_raw = bot.get("id")
             bot_key = str(bot_id_raw)
-
             candidate = by_bot.get(bot_key)
-            action = self._sanitize_for_bot(candidate, bot, bot_id_raw)
+            sanitized_by_bot[bot_key] = self._sanitize_for_bot(candidate, bot, bot_id_raw)
+            current_pos[bot_key] = self._position(bot)
 
-            destination = self._destination(bot, action)
+        desired_dest: Dict[str, Pos] = {
+            k: self._destination(self.bots_by_id[k], a) for k, a in sanitized_by_bot.items()
+        }
 
-            # Same-destination conflict resolution
-            if destination in occupied_destinations and action["action"] != "wait":
-                action = {"bot": bot_id_raw, "action": "wait"}
-                destination = self._destination(bot, action)
+        # If a bot attempts to move into a currently occupied tile whose occupant is not leaving,
+        # force the moving bot to wait.
+        for bot_key, action in list(sanitized_by_bot.items()):
+            if action.get("action") not in _MOVE_DELTAS:
+                continue
+            dest = desired_dest[bot_key]
+            occupant = next((other for other, pos in current_pos.items() if other != bot_key and pos == dest), None)
+            if occupant is not None and desired_dest.get(occupant) == current_pos[occupant]:
+                sanitized_by_bot[bot_key] = {"bot": self.bots_by_id[bot_key].get("id"), "action": "wait"}
+                desired_dest[bot_key] = current_pos[bot_key]
 
+        # Block direct swaps (A->B and B->A in the same tick).
+        for a in list(sanitized_by_bot.keys()):
+            for b in list(sanitized_by_bot.keys()):
+                if a >= b:
+                    continue
+                if desired_dest[a] == current_pos[b] and desired_dest[b] == current_pos[a]:
+                    if desired_dest[a] != current_pos[a] or desired_dest[b] != current_pos[b]:
+                        sanitized_by_bot[a] = {"bot": self.bots_by_id[a].get("id"), "action": "wait"}
+                        sanitized_by_bot[b] = {"bot": self.bots_by_id[b].get("id"), "action": "wait"}
+                        desired_dest[a] = current_pos[a]
+                        desired_dest[b] = current_pos[b]
+
+        # Same destination conflict resolution (deterministic by bot order in state).
+        occupied_destinations: set[Pos] = set()
+        result: List[Action] = []
+        for bot in bots_in_order:
+            bot_key = str(bot.get("id"))
+            action = sanitized_by_bot[bot_key]
+            destination = desired_dest[bot_key]
+            if destination in occupied_destinations and action.get("action") != "wait":
+                action = {"bot": bot.get("id"), "action": "wait"}
+                destination = current_pos[bot_key]
             occupied_destinations.add(destination)
-            sanitized.append(action)
+            result.append(action)
 
-        return sanitized
+        return result
 
     # ----------------------------
     # Sanitization + collision

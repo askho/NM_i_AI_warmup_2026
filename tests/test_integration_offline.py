@@ -392,3 +392,40 @@ def test_conflict_resolution_no_duplicate_destinations() -> None:
     logger.info("Destinations: %s", destinations)
     require(len(destinations) == len(set(destinations)), f"Duplicate destinations found: {destinations}")
     require(destinations.count((1, 1)) <= 1, f"Too many bots moving into (1,1): {destinations}")
+
+def test_conflict_resolution_blocks_move_into_waiting_bot_cell() -> None:
+    state = normalize_state_for_controller(make_minimal_state())
+    validate_state_minimum(state)
+    state["bots"][0]["position"] = {"x": 0, "y": 1}
+    state["bots"][1]["position"] = {"x": 1, "y": 1}
+
+    def blocking_policy(_state: Dict[str, Any], _controller: BotController) -> List[Action]:
+        return [
+            {"bot": 0, "action": "move_right"},  # attempts to enter bot 1 cell
+            {"bot": 1, "action": "wait"},
+            {"bot": 2, "action": "wait"},
+        ]
+
+    controller = BotController(blocking_policy)
+    actions = controller.act(state)
+    got = {str(a["bot"]): a["action"] for a in actions}
+    require(got["0"] == "wait", f"Bot 0 should be blocked from entering occupied wait cell, got {got}")
+
+
+def test_conflict_resolution_blocks_direct_swaps() -> None:
+    state = normalize_state_for_controller(make_minimal_state())
+    validate_state_minimum(state)
+    state["bots"][0]["position"] = {"x": 0, "y": 1}
+    state["bots"][1]["position"] = {"x": 1, "y": 1}
+
+    def swap_policy(_state: Dict[str, Any], _controller: BotController) -> List[Action]:
+        return [
+            {"bot": 0, "action": "move_right"},  # (0,1)->(1,1)
+            {"bot": 1, "action": "move_left"},   # (1,1)->(0,1) swap
+            {"bot": 2, "action": "wait"},
+        ]
+
+    controller = BotController(swap_policy)
+    actions = controller.act(state)
+    got = {str(a["bot"]): a["action"] for a in actions}
+    require(got["0"] == "wait" and got["1"] == "wait", f"Swap should be blocked, got {got}")
